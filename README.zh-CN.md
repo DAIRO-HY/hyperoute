@@ -49,8 +49,8 @@ pub async fn get_user(id: i64, verbose: bool) -> Result<User, ApiError> {
 
 ```toml
 [dependencies]
-hyperoute-core = "0.0.1"
-hyperoute-macro = "0.0.1"
+hyperoute-core = "0.0.2"
+hyperoute-macro = "0.0.2"
 # 生成的路由代码会直接用到下面这几个 crate：
 hyper = { version = "1", features = ["full"] }
 http-body-util = "0.1"
@@ -60,7 +60,7 @@ tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 
 [build-dependencies]
-hyperoute-codegen = "0.0.1"
+hyperoute-codegen = "0.0.2"
 ```
 
 **2. `build.rs`**：扫描 handler 所在目录，把生成的路由代码写到 `OUT_DIR`

@@ -42,8 +42,8 @@ pub async fn get_user(id: i64, verbose: bool) -> Result<User, ApiError> {
 
 ```toml
 [dependencies]
-hyperoute-core = "0.0.1"
-hyperoute-macro = "0.0.1"
+hyperoute-core = "0.0.2"
+hyperoute-macro = "0.0.2"
 # The generated router uses these crates directly:
 hyper = { version = "1", features = ["full"] }
 http-body-util = "0.1"
@@ -53,7 +53,7 @@ tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 
 [build-dependencies]
-hyperoute-codegen = "0.0.1"
+hyperoute-codegen = "0.0.2"
 ```
 
 **2. `build.rs`**: scan your handler directories and write the router into `OUT_DIR`

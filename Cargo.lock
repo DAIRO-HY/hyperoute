@@ -322,7 +322,7 @@ dependencies = [
 
 [[package]]
 name = "hyperoute-codegen"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "flate2",
  "quote",
@@ -331,7 +331,7 @@ dependencies = [
 
 [[package]]
 name = "hyperoute-core"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "flate2",
  "form_urlencoded",
@@ -352,11 +352,11 @@ dependencies = [
 
 [[package]]
 name = "hyperoute-macro"
-version = "0.0.1"
+version = "0.0.2"
 
 [[package]]
 name = "hyperoute-sample"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "http-body-util",
  "hyper",
