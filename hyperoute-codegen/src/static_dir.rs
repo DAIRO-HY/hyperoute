@@ -5,6 +5,8 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
+use crate::html_include;
+
 /// 是否把静态资源打包进二进制。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Embed {
@@ -36,6 +38,7 @@ pub struct StaticDir {
     cache_control: Option<String>,
     gzip: bool,
     gzip_prewarm: bool,
+    html_include: bool,
 }
 
 impl StaticDir {
@@ -52,6 +55,7 @@ impl StaticDir {
             cache_control: None,
             gzip: false,
             gzip_prewarm: false,
+            html_include: false,
         }
     }
 
@@ -97,6 +101,15 @@ impl StaticDir {
         self.gzip_prewarm = enabled;
         self
     }
+
+    /// html 模板合并：页面里的 `{{template include/head}}` 替换成 `include/head.tpl.html` 的内容（可嵌套）；
+    /// 不以 `/` 开头的路径相对当前文件所在目录，以 `/` 开头的相对资源根目录。
+    /// 合并之后的页面按普通静态文件处理（ETag / gzip / 304 照常）；`.tpl.html` 模板片段不对外提供。
+    /// 打包模式在编译期合并（模板不存在或循环引用时编译报错）；磁盘模式在请求时合并并缓存，模板变化后自动更新。
+    pub fn html_include(mut self, enabled: bool) -> Self {
+        self.html_include = enabled;
+        self
+    }
 }
 
 /// 编译期处理后的挂载点，用于生成源码。
@@ -109,6 +122,7 @@ pub(crate) struct StaticInfo {
     cache_control: Option<String>,
     gzip: bool,
     gzip_prewarm: bool,
+    html_include: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -172,7 +186,7 @@ fn prepare_one(mount_index: usize, config: &StaticDir) -> StaticInfo {
         }
         // 资源变化时重新编译（cargo 会递归检查目录下的所有文件）
         println!("cargo:rerun-if-changed={}", dir.display());
-        SourceInfo::Embedded(embed_files(mount_index, &config.prefix, &dir, config.gzip))
+        SourceInfo::Embedded(embed_files(mount_index, &config.prefix, &dir, config.gzip, config.html_include))
     } else {
         SourceInfo::Disk {
             default_root: dir.to_string_lossy().into_owned(),
@@ -187,6 +201,7 @@ fn prepare_one(mount_index: usize, config: &StaticDir) -> StaticInfo {
         cache_control: config.cache_control.clone(),
         gzip: config.gzip,
         gzip_prewarm: config.gzip_prewarm,
+        html_include: config.html_include,
     }
 }
 
@@ -226,7 +241,7 @@ fn collect_files(root: &Path) -> Vec<(String, PathBuf)> {
     files
 }
 
-fn embed_files(mount_index: usize, prefix: &str, root: &Path, gzip: bool) -> Vec<EmbeddedEntry> {
+fn embed_files(mount_index: usize, prefix: &str, root: &Path, gzip: bool, html_include: bool) -> Vec<EmbeddedEntry> {
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("打包静态资源需要在 build.rs 里调用（缺少 OUT_DIR）"))
         .join("hyperoute_static")
         .join(mount_index.to_string());
@@ -235,13 +250,31 @@ fn embed_files(mount_index: usize, prefix: &str, root: &Path, gzip: bool) -> Vec
     let mut total: u64 = 0;
     let entries = collect_files(root)
         .into_iter()
+        // 模板片段只用于合并，不打包、不对外提供
+        .filter(|(rel, _)| !(html_include && html_include::is_template(rel)))
         .enumerate()
         .map(|(file_index, (rel, path))| {
-            let raw = fs::read(&path).unwrap_or_else(|e| panic!("读取静态资源失败 {}: {e}", path.display()));
+            let mut include = path.to_string_lossy().into_owned();
+            // 先合并模板，合并结果写到 OUT_DIR，之后按普通文件处理（ETag / gzip 都基于合并后的内容）
+            let raw = if html_include && html_include::is_html_page(&rel) {
+                let merged = html_include::merge(root, &path)
+                    .unwrap_or_else(|e| panic!("静态资源 {prefix} 模板合并失败：{e}"));
+                for dependency in &merged.dependencies {
+                    println!("cargo:rerun-if-changed={}", dependency.display());
+                }
+                if merged.changed {
+                    let merged_path = out_dir.join(format!("{file_index}.merged.html"));
+                    fs::write(&merged_path, &merged.content).expect("写入合并后的 html 失败");
+                    include = merged_path.to_string_lossy().into_owned();
+                }
+                merged.content.into_bytes()
+            } else {
+                fs::read(&path).unwrap_or_else(|e| panic!("读取静态资源失败 {}: {e}", path.display()))
+            };
             let hash = fnv1a(&raw);
             let mut entry = EmbeddedEntry {
                 path: rel.clone(),
-                include: path.to_string_lossy().into_owned(),
+                include,
                 gzip: false,
                 etag: format!("\"{hash:016x}\""),
             };
@@ -312,13 +345,14 @@ pub(crate) fn render(infos: &[StaticInfo]) -> String {
         };
         let _ = writeln!(
             out,
-            "static __STATIC_MOUNT_{i}: hyperoute_core::StaticMount = hyperoute_core::StaticMount {{ prefix: {:?}, source: {source}, index: {}, spa_fallback: {}, cache_control: {}, gzip: {}, gzip_prewarm: {} }};",
+            "static __STATIC_MOUNT_{i}: hyperoute_core::StaticMount = hyperoute_core::StaticMount {{ prefix: {:?}, source: {source}, index: {}, spa_fallback: {}, cache_control: {}, gzip: {}, gzip_prewarm: {}, html_include: {} }};",
             info.prefix,
             option_literal(info.index.as_deref()),
             info.spa_fallback,
             option_literal(info.cache_control.as_deref()),
             info.gzip,
             info.gzip_prewarm,
+            info.html_include,
         );
         mount_names.push(format!("&__STATIC_MOUNT_{i}"));
     }

@@ -42,8 +42,8 @@ pub async fn get_user(id: i64, verbose: bool) -> Result<User, ApiError> {
 
 ```toml
 [dependencies]
-hyperoute-core = "0.0.3"
-hyperoute-macro = "0.0.3"
+hyperoute-core = "0.0.4"
+hyperoute-macro = "0.0.4"
 # The generated router uses these crates directly:
 hyper = { version = "1", features = ["full"] }
 http-body-util = "0.1"
@@ -53,7 +53,7 @@ tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 
 [build-dependencies]
-hyperoute-codegen = "0.0.3"
+hyperoute-codegen = "0.0.4"
 ```
 
 **2. `build.rs`**: scan your handler directories and write the router into `OUT_DIR`
@@ -378,7 +378,8 @@ let routes = hyperoute_codegen::Scanner::new()
             .index("index.html")            // served for directory requests (default)
             .spa_fallback(false)            // serve index.html for unknown page routes (Vue/React history mode)
             .cache_control("no-cache")      // optional Cache-Control header
-            .gzip(true),                    // compress text assets (default: off)
+            .gzip(true)                     // compress text assets (default: off)
+            .html_include(true),            // merge {{template ...}} fragments into pages (default: off)
     )
     .scan();
 ```
@@ -415,6 +416,21 @@ hyperoute_core::set_static_root("/static", "/path/known/only/at/runtime");
 
 - **Embedded mode**: files are compressed at build time with the best level, and **only the compressed version is stored**. It is always served with `Content-Encoding: gzip`, because browsers decompress automatically. Use `curl --compressed` when testing.
 - **Disk mode**: gzip is used only when the client sends `Accept-Encoding: gzip`. hyperoute first looks for a ready-made `app.js.gz` next to the file and serves it if it isn't older than the original. Otherwise it compresses on the first request and caches the result on disk. The cache is invalidated automatically when the file changes. You can set the cache directory with `hyperoute_core::set_static_cache_dir(...)`. `.gzip_prewarm(true)` compresses everything in the background after the first request. Files over 16 MB are never compressed at runtime; ship a `.gz` next to them instead.
+
+**HTML includes** (`.html_include(true)`). Pages can share fragments such as a `<head>` block or a nav bar. This is a pre-processing step: pages are merged first, and the merged result is then served exactly like any other static file, with the same ETag/304, gzip and Cache-Control behavior.
+
+```html
+<!-- index.html -->
+<head>{{template include/head}}</head>   <!-- inserts include/head.tpl.html -->
+<body>{{template /include/top-bar}} ...  <!-- a leading / resolves from the static root -->
+```
+
+- **Syntax.** `{{template NAME}}` inserts `NAME.tpl.html`. Extra spaces and quotes (`{{ template "a b" }}`) are allowed, and fragments can include other fragments. A `{{ ... }}` without the `template` keyword, such as Vue or Mustache `{{ value }}`, is left untouched.
+- **Path resolution.** A relative `NAME` resolves from the directory of the file that contains it. A leading `/` resolves from the static root. A fragment must stay inside the static root.
+- **Fragments are never served.** `*.tpl.html` files are only used for merging and answer `404`.
+- **Embedded mode** merges at build time. A missing fragment or a circular include **fails the build**, and the message shows the include chain.
+- **Disk mode** merges on request and stores the result as a file in the cache directory. Editing a page or any fragment it uses (directly or indirectly) is picked up on the next request without a restart. A missing fragment answers `500` and is logged.
+- **Scope.** This is static fragment composition only, with no variables or loops. For server-side rendering with data, use a template engine such as askama or minijinja in a handler.
 
 ## Running the server
 
@@ -457,7 +473,7 @@ $ curl -H 'Authorization: Bearer demo-token' http://127.0.0.1:3000/api/profile
 | `filter/access_log.rs` | Timing filter: after phase |
 | `error.rs` | A shared JSON error type |
 | `server.rs` | `serve` and a custom accept loop with `serve_connection` |
-| `static/` + `build.rs` | Static files at `/static`: sub-directories, gzip, ETag/304, and `static/private/` protected by the auth filter |
+| `static/` + `build.rs` | Static files at `/static`: sub-directories, gzip, ETag/304, HTML includes (`static/include/header.tpl.html`), and `static/private/` protected by the auth filter |
 
 Every handler has a `curl` command in its doc comment.
 

@@ -7,6 +7,10 @@
 //! - **磁盘**（[`StaticSource::Disk`]）：运行时按路径读文件，根目录可用 [`set_static_root`] 在运行时指定。
 //!   开启 gzip 时优先使用旁边现成的 `xxx.gz`，否则首次访问时压缩并缓存到磁盘，文件变化后自动失效。
 //!
+//! 开启 `html_include` 时，html 页面先做模板合并（见 `html_include` 模块），合并结果再按普通静态文件处理：
+//! 打包模式在编译期合并后打包；磁盘模式把合并结果存成缓存目录里的真实文件，页面或任何被引用的模板变化后
+//! 自动重新合并。`.tpl.html` 模板片段不对外提供。
+//!
 //! 静态资源只在没有动态路由匹配时才查找；请求同样经过过滤器（入口已统一规范化路径）。
 
 use std::collections::HashMap;
@@ -23,6 +27,7 @@ use hyper::header::{self, HeaderValue};
 use hyper::{Method, StatusCode};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
+use crate::html_include::{self, IncludeError};
 use crate::request_path::request_path;
 use crate::{Request, Response, ResponseBody};
 
@@ -66,6 +71,8 @@ pub struct StaticMount {
     pub gzip: bool,
     /// 磁盘模式：首次请求时在后台把可压缩文件预先压缩进缓存
     pub gzip_prewarm: bool,
+    /// html 模板合并（`{{template include/head}}`）；`.tpl.html` 不对外提供
+    pub html_include: bool,
 }
 
 static ROOT_OVERRIDES: LazyLock<RwLock<HashMap<String, PathBuf>>> = LazyLock::new(Default::default);
@@ -188,6 +195,10 @@ pub async fn serve_static(mounts: &'static [&'static StaticMount], req: &Request
     if rel.iter().any(|segment| segment.starts_with('.')) {
         return None;
     }
+    // 模板片段只用于合并，不对外提供
+    if mount.html_include && rel.last().is_some_and(|last| html_include::is_template(last)) {
+        return None;
+    }
     let dir_request = path.ends_with('/');
 
     match mount.source {
@@ -270,6 +281,8 @@ enum DiskHit {
     File { path: PathBuf, meta: Metadata },
     Redirect,
     NotFound,
+    /// 模板合并失败（引用的模板不存在、循环引用等），属于服务端问题
+    Error,
 }
 
 async fn serve_disk(mount: &StaticMount, root: &Path, req: &Request, rel: &[&str], dir_request: bool) -> Option<Response> {
@@ -277,11 +290,26 @@ async fn serve_disk(mount: &StaticMount, root: &Path, req: &Request, rel: &[&str
     let rel_owned: Vec<String> = rel.iter().map(|s| s.to_string()).collect();
     let index = mount.index;
     let spa = spa_applies(mount, rel);
+    let include = mount.html_include;
 
     let hit = tokio::task::spawn_blocking(move || {
         let rel: Vec<&str> = rel_owned.iter().map(String::as_str).collect();
-        match resolve_disk(&root, &rel, dir_request, index) {
+        let hit = match resolve_disk(&root, &rel, dir_request, index) {
             DiskHit::NotFound if spa => resolve_disk(&root, &[], true, index),
+            other => other,
+        };
+        match hit {
+            // 先合并模板，再把合并结果当成普通文件交给后面的逻辑
+            DiskHit::File { path, meta } if include && html_include::is_html_page(&path.to_string_lossy()) => {
+                match materialize_html(&root, &path, &meta) {
+                    Ok(Some((merged, merged_meta))) => DiskHit::File { path: merged, meta: merged_meta },
+                    Ok(None) => DiskHit::File { path, meta },
+                    Err(error) => {
+                        eprintln!("[hyperoute] html include error for {}: {error}", path.display());
+                        DiskHit::Error
+                    }
+                }
+            }
             other => other,
         }
     })
@@ -291,6 +319,7 @@ async fn serve_disk(mount: &StaticMount, root: &Path, req: &Request, rel: &[&str
     match hit {
         DiskHit::NotFound => None,
         DiskHit::Redirect => Some(redirect_to_dir(req)),
+        DiskHit::Error => Some(crate::internal_error_response()),
         DiskHit::File { path, meta } => Some(serve_disk_file(mount, req, path, meta).await),
     }
 }
@@ -393,6 +422,77 @@ async fn serve_disk_file(mount: &StaticMount, req: &Request, path: PathBuf, meta
     stream_file(builder, req, &path, 0, meta.len()).await
 }
 
+// 合并结果缓存：缓存目录下 `html/<路径哈希>.html`（合并后的页面）+ `html/<路径哈希>.inc`（依赖清单）。
+// 清单格式（文本，每行一项）：
+//   HINC1
+//   <页面大小> <页面修改时间纳秒>
+//   merged | plain            （plain 表示页面没有模板调用，直接用原文件）
+//   <模板大小> <模板修改时间纳秒> <模板路径>   （每个依赖一行）
+const INCLUDE_MANIFEST_MAGIC: &str = "HINC1";
+
+/// 磁盘模式下的模板合并：返回合并后的缓存文件；页面没有模板调用时返回 None（直接用原文件）。
+/// 页面本身或任何被引用的模板变化后自动重新合并。
+fn materialize_html(root: &Path, page: &Path, meta: &Metadata) -> Result<Option<(PathBuf, Metadata)>, String> {
+    let dir = cache_dir().join("html");
+    let key = format!("{:016x}", fnv1a(page.to_string_lossy().as_bytes()));
+    let merged_path = dir.join(format!("{key}.html"));
+    let manifest_path = dir.join(format!("{key}.inc"));
+    let stamp = |m: &Metadata| format!("{} {}", m.len(), mtime_nanos(m));
+
+    // 清单有效（页面和所有依赖都没变）就直接用上次的结果
+    if let Ok(manifest) = std::fs::read_to_string(&manifest_path) {
+        let mut lines = manifest.lines();
+        let fresh = lines.next() == Some(INCLUDE_MANIFEST_MAGIC) && lines.next() == Some(stamp(meta).as_str());
+        let kind = lines.next();
+        let deps_fresh = fresh
+            && lines.all(|line| {
+                let mut parts = line.splitn(3, ' ');
+                let (Some(len), Some(mtime), Some(path)) = (parts.next(), parts.next(), parts.next()) else {
+                    return false;
+                };
+                std::fs::metadata(path).is_ok_and(|m| stamp(&m) == format!("{len} {mtime}"))
+            });
+        if deps_fresh {
+            match kind {
+                Some("plain") => return Ok(None),
+                Some("merged") => {
+                    if let Ok(merged_meta) = std::fs::metadata(&merged_path) {
+                        return Ok(Some((merged_path, merged_meta)));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let merged = html_include::merge(root, page).map_err(|e: IncludeError| e.to_string())?;
+    let mut manifest = format!("{INCLUDE_MANIFEST_MAGIC}\n{}\n{}\n", stamp(meta), if merged.changed { "merged" } else { "plain" });
+    for dep in &merged.dependencies {
+        let dep_meta = std::fs::metadata(dep).map_err(|e| format!("{}: {e}", dep.display()))?;
+        manifest.push_str(&format!("{} {}\n", stamp(&dep_meta), dep.display()));
+    }
+
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    if merged.changed {
+        write_atomic(&dir, &merged_path, merged.content.as_bytes()).map_err(|e| e.to_string())?;
+    }
+    write_atomic(&dir, &manifest_path, manifest.as_bytes()).map_err(|e| e.to_string())?;
+
+    if !merged.changed {
+        return Ok(None);
+    }
+    let merged_meta = std::fs::metadata(&merged_path).map_err(|e| e.to_string())?;
+    Ok(Some((merged_path, merged_meta)))
+}
+
+/// 先写临时文件再 rename，保证并发请求不会读到写了一半的文件。
+fn write_atomic(dir: &Path, target: &Path, data: &[u8]) -> io::Result<()> {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let tmp = dir.join(format!(".tmp-{}-{}", std::process::id(), COUNTER.fetch_add(1, Ordering::Relaxed)));
+    std::fs::write(&tmp, data)?;
+    std::fs::rename(&tmp, target)
+}
+
 struct GzipFile {
     path: PathBuf,
     offset: u64,
@@ -468,18 +568,12 @@ fn ensure_gzip_cache(path: &Path, meta: &Metadata) -> io::Result<Option<GzipFile
     header[8..16].copy_from_slice(&meta.len().to_le_bytes());
     header[16..24].copy_from_slice(&mtime.to_le_bytes());
 
-    // 先写临时文件再 rename，保证并发请求不会读到写了一半的缓存
     std::fs::create_dir_all(&dir)?;
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let tmp = dir.join(format!(".tmp-{}-{}", std::process::id(), COUNTER.fetch_add(1, Ordering::Relaxed)));
-    {
-        let mut file = std::fs::File::create(&tmp)?;
-        file.write_all(&header)?;
-        if worth {
-            file.write_all(&compressed)?;
-        }
+    let mut data = header.to_vec();
+    if worth {
+        data.extend_from_slice(&compressed);
     }
-    std::fs::rename(&tmp, &cache_path)?;
+    write_atomic(&dir, &cache_path, &data)?;
 
     Ok(worth.then(|| GzipFile { path: cache_path, offset: CACHE_HEADER_LEN, len: compressed.len() as u64 }))
 }

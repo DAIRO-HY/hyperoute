@@ -18,6 +18,8 @@ fn main() {
             StaticDir::new("/static", manifest_dir.join("static"))
                 .embed(Embed::Release)
                 .gzip(true)
+                // html 里的 {{template include/header}} 先合并成完整页面，再按普通静态文件处理
+                .html_include(true)
                 // no-cache：浏览器每次都带 ETag 来验证，没变就是 304
                 .cache_control("no-cache"),
         )

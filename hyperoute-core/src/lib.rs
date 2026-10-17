@@ -13,6 +13,7 @@ use hyper::body::{Bytes, Frame};
 
 mod extract;
 mod filter;
+mod html_include;
 mod param;
 mod request_path;
 mod server;

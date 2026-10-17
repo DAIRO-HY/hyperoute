@@ -7,10 +7,8 @@
   <link rel="stylesheet" href="css/app.css">
 </head>
 <body>
-  <header>
-    <img src="img/logo.svg" alt="logo" width="48" height="48">
-    <h1>hyperoute static files</h1>
-  </header>
+  <!-- 模板合并：替换成 include/header.tpl.html 的内容（相对当前文件所在目录） -->
+  {{template include/header}}
   <main>
     <p>This page, its stylesheet, script and images are served from <code>hyperoute-sample/static</code>.</p>
     <ul>

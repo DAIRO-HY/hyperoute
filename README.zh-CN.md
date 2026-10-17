@@ -49,8 +49,8 @@ pub async fn get_user(id: i64, verbose: bool) -> Result<User, ApiError> {
 
 ```toml
 [dependencies]
-hyperoute-core = "0.0.3"
-hyperoute-macro = "0.0.3"
+hyperoute-core = "0.0.4"
+hyperoute-macro = "0.0.4"
 # 生成的路由代码会直接用到下面这几个 crate：
 hyper = { version = "1", features = ["full"] }
 http-body-util = "0.1"
@@ -60,7 +60,7 @@ tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 
 [build-dependencies]
-hyperoute-codegen = "0.0.3"
+hyperoute-codegen = "0.0.4"
 ```
 
 **2. `build.rs`**：扫描 handler 所在目录，把生成的路由代码写到 `OUT_DIR`
@@ -411,7 +411,8 @@ let routes = hyperoute_codegen::Scanner::new()
             .index("index.html")            // 访问目录时返回的文件（默认）
             .spa_fallback(false)            // 未知页面路由返回 index.html（Vue/React history 模式）
             .cache_control("no-cache")      // 可选的 Cache-Control 响应头
-            .gzip(true),                    // 压缩文本类资源（默认关闭）
+            .gzip(true)                     // 压缩文本类资源（默认关闭）
+            .html_include(true),            // 把 {{template ...}} 片段合并进页面（默认关闭）
     )
     .scan();
 ```
@@ -452,6 +453,21 @@ hyperoute_core::set_static_root("/static", "/path/known/only/at/runtime");
   - 否则第一次请求时压缩，结果缓存在磁盘上，文件变化后缓存自动失效。缓存目录可以用 `hyperoute_core::set_static_cache_dir(...)` 设置。
   - `.gzip_prewarm(true)` 会在第一个请求之后，在后台把所有文件预先压缩好。
   - 超过 16 MB 的文件不会在运行时压缩，可以在旁边放一个现成的 `.gz` 文件。
+
+**HTML 模板合并**（`.html_include(true)`）。多个页面可以共用 `<head>`、导航栏这类片段。它是一个前置处理步骤：页面先合并，合并结果再和其它静态文件一样处理，ETag/304、gzip、Cache-Control 的行为完全相同。
+
+```html
+<!-- index.html -->
+<head>{{template include/head}}</head>   <!-- 插入 include/head.tpl.html 的内容 -->
+<body>{{template /include/top-bar}} ...  <!-- 以 / 开头：从静态资源根目录查找 -->
+```
+
+- **语法**：`{{template NAME}}` 插入 `NAME.tpl.html` 的内容。允许多余的空格，也允许给名字加引号（`{{ template "a b" }}`）。模板片段里还可以继续引用其它片段。不带 `template` 关键字的 `{{ ... }}` 原样保留，比如 Vue、Mustache 的 `{{ value }}`。
+- **路径解析**：相对路径的 `NAME` 从当前文件所在的目录开始查找；以 `/` 开头的从静态资源根目录开始查找。模板片段必须位于静态资源根目录之内。
+- **模板片段不对外提供**：`*.tpl.html` 只用于合并，直接访问返回 `404`。
+- **打包模式**：编译期合并。引用的片段不存在或者出现循环引用时，**编译直接报错**，报错信息会显示完整的引用链。
+- **磁盘模式**：请求时合并，结果作为文件存放在缓存目录里。修改页面本身，或者它直接、间接引用的任何片段，下次请求就会生效，不需要重启。引用的片段不存在时返回 `500` 并记录日志。
+- **适用范围**：这里只做静态片段的拼接，不支持变量和循环。需要根据数据在服务端渲染页面时，请在 handler 里使用 askama、minijinja 这类模板引擎。
 
 ## 启动服务
 
@@ -494,7 +510,7 @@ $ curl -H 'Authorization: Bearer demo-token' http://127.0.0.1:3000/api/profile
 | `filter/access_log.rs` | 计时过滤器：after 阶段 |
 | `error.rs` | 统一的 JSON 错误类型 |
 | `server.rs` | `serve`，以及用 `serve_connection` 自己写 accept 循环 |
-| `static/` + `build.rs` | 挂在 `/static` 的静态资源：子目录、gzip、ETag/304，`static/private/` 受 auth 过滤器保护 |
+| `static/` + `build.rs` | 挂在 `/static` 的静态资源：子目录、gzip、ETag/304、HTML 模板合并（`static/include/header.tpl.html`），`static/private/` 受 auth 过滤器保护 |
 
 每个 handler 的文档注释里都附了对应的 `curl` 命令。
 

@@ -25,6 +25,10 @@ fn write(root: &Path, rel: &str, content: impl AsRef<[u8]>) {
 }
 
 fn mount(prefix: &'static str, root: &Path, gzip: bool, spa: bool) -> &'static [&'static StaticMount] {
+    mount_with(prefix, root, gzip, spa, false)
+}
+
+fn mount_with(prefix: &'static str, root: &Path, gzip: bool, spa: bool, html_include: bool) -> &'static [&'static StaticMount] {
     let root: &'static str = Box::leak(root.to_string_lossy().into_owned().into_boxed_str());
     let mount: &'static StaticMount = Box::leak(Box::new(StaticMount {
         prefix,
@@ -34,6 +38,7 @@ fn mount(prefix: &'static str, root: &Path, gzip: bool, spa: bool) -> &'static [
         cache_control: Some("public, max-age=60"),
         gzip,
         gzip_prewarm: false,
+        html_include,
     }));
     Box::leak(vec![mount].into_boxed_slice())
 }
@@ -205,4 +210,68 @@ async fn spa_fallback_only_for_page_routes() {
 
     assert_eq!(body(get(mounts, "/app/users/42", &[]).await.unwrap()).await, b"<app/>");
     assert!(get(mounts, "/app/missing.js", &[]).await.is_none());
+}
+
+#[tokio::test]
+async fn html_include_merges_then_serves_as_static_file() {
+    let root = temp_root("include");
+    write(&root, "include/head.tpl.html", "<meta charset=utf-8>{{template nav}}");
+    write(&root, "include/nav.tpl.html", "<nav>v1</nav>");
+    write(&root, "index.html", "<head>{{template include/head}}</head><p>{{ vue }}</p>");
+    write(&root, "docs/index.html", "{{template /include/nav}}");
+    write(&root, "plain.html", "<p>plain</p>");
+    write(&root, "big.html", &format!("{{{{template include/nav}}}}{}", "<li>row</li>".repeat(300)));
+    let mounts = mount_with("/", &root, true, false, true);
+
+    // 合并后的内容；`{{ vue }}` 这类非模板调用原样保留
+    let response = get(mounts, "/", &[]).await.unwrap();
+    assert_eq!(header(&response, "content-type"), Some("text/html; charset=utf-8"));
+    let etag_v1 = header(&response, "etag").unwrap().to_string();
+    assert_eq!(body(response).await, b"<head><meta charset=utf-8><nav>v1</nav></head><p>{{ vue }}</p>");
+    // 子目录里用 `/` 开头的路径引用根目录下的模板
+    assert_eq!(body(get(mounts, "/docs/", &[]).await.unwrap()).await, b"<nav>v1</nav>");
+    // 没有模板调用的页面原样返回
+    assert_eq!(body(get(mounts, "/plain.html", &[]).await.unwrap()).await, b"<p>plain</p>");
+
+    // 模板片段不对外提供
+    assert!(get(mounts, "/include/head.tpl.html", &[]).await.is_none());
+    assert!(get(mounts, "/include/NAV.TPL.HTML", &[]).await.is_none());
+
+    // 合并结果按普通静态文件处理：304 / gzip 照常
+    assert_eq!(get(mounts, "/", &[("if-none-match", &etag_v1)]).await.unwrap().status(), 304);
+    let response = get(mounts, "/big.html", &[("accept-encoding", "gzip")]).await.unwrap();
+    assert_eq!(header(&response, "content-encoding"), Some("gzip"));
+    assert!(gunzip(&body(response).await).starts_with(b"<nav>v1</nav><li>row</li>"));
+
+    // 被间接引用的模板变化后自动重新合并，ETag 随之变化
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    write(&root, "include/nav.tpl.html", "<nav>v2</nav>");
+    let response = get(mounts, "/", &[("if-none-match", &etag_v1)]).await.unwrap();
+    assert_eq!(response.status(), 200);
+    assert_ne!(header(&response, "etag").unwrap(), etag_v1);
+    assert_eq!(body(response).await, b"<head><meta charset=utf-8><nav>v2</nav></head><p>{{ vue }}</p>");
+    let response = get(mounts, "/big.html", &[("accept-encoding", "gzip")]).await.unwrap();
+    assert!(gunzip(&body(response).await).starts_with(b"<nav>v2</nav>"));
+
+    // 引用的模板不存在：服务端问题，500
+    write(&root, "broken.html", "{{template include/missing}}");
+    assert_eq!(get(mounts, "/broken.html", &[]).await.unwrap().status(), 500);
+
+    // 不开启 html_include 时，模板调用原样返回，.tpl.html 也是普通文件
+    let plain_mounts = mount("/", &root, false, false);
+    assert_eq!(body(get(plain_mounts, "/docs/", &[]).await.unwrap()).await, b"{{template /include/nav}}");
+    assert!(get(plain_mounts, "/include/nav.tpl.html", &[]).await.is_some());
+}
+
+/// hyperoute-core 和 hyperoute-codegen 各有一份 html_include.rs，必须完全一致。
+/// （打包发布后另一份不在包里，测试自动跳过。）
+#[test]
+fn html_include_copies_are_identical() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let other = manifest.join("../hyperoute-codegen/src/html_include.rs");
+    if !other.exists() {
+        return;
+    }
+    let mine = std::fs::read_to_string(manifest.join("src/html_include.rs")).unwrap();
+    assert_eq!(mine, std::fs::read_to_string(other).unwrap(), "两份 html_include.rs 不一致，请同步修改");
 }

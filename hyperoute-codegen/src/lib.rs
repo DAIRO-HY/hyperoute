@@ -7,6 +7,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use syn::{FieldsNamed, FnArg, Item, ItemFn, Pat, ReturnType};
 
+mod html_include;
 mod static_dir;
 
 pub use static_dir::{Embed, StaticDir};

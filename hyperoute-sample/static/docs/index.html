@@ -6,6 +6,8 @@
   <link rel="stylesheet" href="../css/app.css">
 </head>
 <body>
+  <!-- 以 / 开头：相对静态资源根目录，子目录里的页面也能引用同一个模板 -->
+  {{template /include/header}}
   <main>
     <h1>docs/index.html</h1>
     <p>Requesting <code>/static/docs</code> redirects (301) to <code>/static/docs/</code>, which serves this file.</p>
