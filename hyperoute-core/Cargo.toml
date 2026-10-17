@@ -16,7 +16,10 @@ hyper = { version = "1", features = ["full"] }
 http-body-util = "0.1"
 futures-util = { version = "0.3", default-features = false, features = ["alloc", "sink"] }
 multer = "3"
-tokio = { version = "1", features = ["fs", "net", "rt", "time"] }
+tokio = { version = "1", features = ["fs", "io-util", "net", "rt", "time"] }
+tokio-util = { version = "0.7", features = ["io"] }
+flate2 = "1"
+httpdate = "1"
 hyper-util = { version = "0.1", features = ["tokio"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 serde = "1"
@@ -29,3 +32,4 @@ form_urlencoded = "1"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["fs", "macros", "rt", "rt-multi-thread"] }
 tokio-tungstenite = { version = "0.30", features = ["connect"] }
+flate2 = "1"

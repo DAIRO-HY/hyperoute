@@ -7,6 +7,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use syn::{FieldsNamed, FnArg, Item, ItemFn, Pat, ReturnType};
 
+mod static_dir;
+
+pub use static_dir::{Embed, StaticDir};
+
 /// 所有识别的属性名；REQUEST 表示匹配任意 HTTP 方法。
 const METHODS: &[&str] = &[
     "GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "CONNECT", "TRACE", "REQUEST",
@@ -139,6 +143,7 @@ pub struct RouteTable {
     routes: Vec<RouteInfo>,
     filters: Vec<FilterInfo>,
     param_error_handler: Option<ParamErrorHandler>,
+    statics: Vec<static_dir::StaticInfo>,
 }
 
 /// 扫描过程中收集到的原始结果。
@@ -160,6 +165,7 @@ struct Collected {
 #[derive(Debug, Clone, Default)]
 pub struct Scanner {
     dirs: Vec<(PathBuf, String)>,
+    statics: Vec<StaticDir>,
 }
 
 impl Scanner {
@@ -170,6 +176,12 @@ impl Scanner {
     /// 追加一个扫描目录；`module` 是这个目录对应的模块路径，例如 "crate::filter"。
     pub fn dir(mut self, dir: impl Into<PathBuf>, module: &str) -> Self {
         self.dirs.push((dir.into(), module.to_string()));
+        self
+    }
+
+    /// 挂载一个静态资源目录，可以挂多个；没有动态路由匹配时才查找静态资源。
+    pub fn static_dir(mut self, dir: StaticDir) -> Self {
+        self.statics.push(dir);
         self
     }
 
@@ -198,6 +210,7 @@ impl Scanner {
             routes: collected.routes,
             filters,
             param_error_handler: handlers.pop(),
+            statics: static_dir::prepare(&self.statics),
         }
     }
 }
@@ -686,11 +699,14 @@ pub fn generate_router_source(table: &RouteTable) -> String {
         None => "hyperoute_core::error_response(&hyperoute_core::DefaultParamErrorResponse(errors))".to_string(),
     };
 
+    let static_mounts = static_dir::render(&table.statics);
+
     format!(
         r#"// 本文件由 hyperoute-codegen 在编译期通过 build.rs 自动生成，请勿手动修改。
 #[allow(unused_imports)]
 use http_body_util::BodyExt;
 
+{static_mounts}
 /// 参数解析失败：交给 `__param_error` 生成响应并提前返回。
 #[allow(unused_macros)]
 macro_rules! __try_param {{
@@ -728,11 +744,16 @@ async fn __param_error(
     {param_error_response}
 }}
 
-/// 入口：把请求 body 装箱成统一类型，然后从第一个过滤器开始执行。
+/// 入口：把请求 body 装箱成统一类型，统一规范化路径（不合法直接 400），然后从第一个过滤器开始执行。
+/// 过滤器匹配、动态路由、静态资源都使用这同一个规范化后的路径。
 pub async fn router(
     req: hyper::Request<hyper::body::Incoming>,
 ) -> Result<hyperoute_core::Response, hyper::Error> {{
-    let req = req.map(hyperoute_core::box_request_body);
+    hyperoute_core::static_init(__STATIC_MOUNTS);
+    let mut req = req.map(hyperoute_core::box_request_body);
+    if let Err(response) = hyperoute_core::normalize_request_path(&mut req) {{
+        return Ok(response);
+    }}
     Ok(__filter_chain(0, req).await)
 }}
 
@@ -757,15 +778,19 @@ async fn __dispatch(
     mut req: hyperoute_core::Request,
 ) -> Result<hyperoute_core::Response, std::convert::Infallible> {{
     let method = req.method().clone();
-    let path = req.uri().path().to_string();
+    let path = hyperoute_core::request_path(&req).to_string();
     let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
 
     let response = match (&method, segments.as_slice()) {{
-{arms}        _ => hyper::Response::builder()
-            .status(hyper::StatusCode::NOT_FOUND)
-            .body(http_body_util::Full::new(hyper::body::Bytes::from("Not Found")))
-            .unwrap()
-            .map(hyperoute_core::boxed_full),
+{arms}        // 没有动态路由匹配：查静态资源，还没有就 404
+        _ => match hyperoute_core::serve_static(__STATIC_MOUNTS, &req).await {{
+            Some(response) => response,
+            None => hyper::Response::builder()
+                .status(hyper::StatusCode::NOT_FOUND)
+                .body(http_body_util::Full::new(hyper::body::Bytes::from("Not Found")))
+                .unwrap()
+                .map(hyperoute_core::boxed_full),
+        }},
     }};
 
     Ok(response)
@@ -996,7 +1021,7 @@ fn write_filter_arm(out: &mut String, index: usize, filter: &FilterInfo) {
     let _ = write!(
         out,
         r#"            {index} => {{
-                if hyperoute_core::filter_applies({include}, {exclude}, req.uri().path()) {{
+                if hyperoute_core::filter_applies({include}, {exclude}, hyperoute_core::request_path(&req)) {{
                     let __next = hyperoute_core::Next::new(|req| __filter_chain({next}, req));
                     {call}
                 }} else {{

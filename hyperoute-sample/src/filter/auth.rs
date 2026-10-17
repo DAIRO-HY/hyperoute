@@ -12,8 +12,9 @@ pub struct CurrentUser {
 }
 
 /// 演示 before 处理、中断请求、向 controller 传数据：
-/// `/api/**` 下除了 `/api/login` 都要求 `Authorization: Bearer <token>`。
-#[FILTER(order = 10, include = ["/api/**"], exclude = ["/api/login"])]
+/// `/api/**` 下除了 `/api/login` 都要求 `Authorization: Bearer <token>`；
+/// 静态资源 `/static/private/**` 同样受保护（静态资源请求也会经过过滤器）。
+#[FILTER(order = 10, include = ["/api/**", "/static/private/**"], exclude = ["/api/login"])]
 pub async fn auth(mut req: Request, next: Next) -> Result<Response, ApiError> {
     let token = req
         .headers()

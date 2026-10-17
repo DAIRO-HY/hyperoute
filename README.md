@@ -24,6 +24,7 @@ pub async fn get_user(id: i64, verbose: bool) -> Result<User, ApiError> {
 - **Parameter errors that never panic**: a malformed parameter returns `400` with a message saying which parameter failed and why. The response format is yours to define. Default messages don't reveal the server's tech stack.
 - **Filters** (`#[FILTER]`): "around"-style middleware with ordering, include/exclude path patterns, short-circuiting, and passing data such as the logged-in user to handlers (`Ext<T>`).
 - **WebSocket** (`#[WEBSOCKET]`): the handshake is handled for you. Handlers get path, query and filter data just like HTTP routes.
+- **Static files**: serve html / js / css / images from disk or embedded in the binary, with ETag/304, optional gzip, sub-directories and filter protection.
 - **Server helpers**: start with one line, or keep full control of the accept loop.
 
 ## Crates
@@ -127,7 +128,7 @@ Hello, world!
 
 ## Routing
 
-The path template is split on `/`. A segment written as `{name}` is a path parameter, and every other segment must match literally. Trailing slashes are ignored. `#[REQUEST("/path")]` matches any HTTP method. Requests that match no route get `404 Not Found`.
+The path template is split on `/`. A segment written as `{name}` is a path parameter, and every other segment must match literally. Trailing slashes are ignored. Each path segment is percent-decoded once at the entry point, and the same decoded path is used for filter matching, routing and static files. For example, a path parameter in `/hello/%E4%B8%AD` receives `中`. Paths containing `..` or an encoded `/` or `\` are rejected with `400`. `#[REQUEST("/path")]` matches any HTTP method. Requests that match no route get `404 Not Found`.
 
 ## Request parameters
 
@@ -342,6 +343,59 @@ pub async fn chat(mut socket: WebSocket, room: String, user: Ext<CurrentUser>) -
 - **Signature rules.** The handler gets exactly one `WebSocket` parameter. It can't take a request body or `&str` parameters, because it runs in a background task and its parameters must be owned. If it returns `Result<_, E>` with `E: Display`, errors are logged.
 - **The API.** `WebSocket` provides `recv`, `send`, `close` and `split`. `split` returns a sender and a receiver that can live in separate tasks, for example one task reading client messages while another pushes broadcasts. When the peer sends `Close`, hyperoute sends the close reply for you, so you can simply `break`.
 
+## Static files
+
+Mount directories of html / js / css / images in `build.rs`. Sub-directories map one-to-one to URL paths:
+
+```rust
+use hyperoute_codegen::{Embed, StaticDir};
+
+let routes = hyperoute_codegen::Scanner::new()
+    .dir(src.join("controller"), "crate::controller")
+    .static_dir(
+        StaticDir::new("/static", manifest_dir.join("static")) // URL prefix, directory
+            .embed(Embed::Release)          // Always | Never | Release (default)
+            .index("index.html")            // served for directory requests (default)
+            .spa_fallback(false)            // serve index.html for unknown page routes (Vue/React history mode)
+            .cache_control("no-cache")      // optional Cache-Control header
+            .gzip(true),                    // compress text assets (default: off)
+    )
+    .scan();
+```
+
+With this setup, `static/img/icons/logo.png` is served at `/static/img/icons/logo.png`.
+
+**Embedded or read from disk?** You choose per directory:
+
+| `Embed` | Behavior |
+|---|---|
+| `Release` (default) | Debug builds read from disk, so edits show up on refresh. Release builds embed the files into the binary. |
+| `Always` | Always embed. Ships as a single binary and can only serve files known at build time. |
+| `Never` | Always read from disk at runtime, for large or frequently changing assets. |
+
+- **Embedded mode**: the file table is generated at build time and looked up with a binary search. Each request serves the bytes straight from the binary, with no I/O and no allocation. Changing a file triggers a rebuild.
+- **Disk mode**: files are resolved at runtime and large files are streamed. The root directory defaults to the configured path and can be changed at runtime, for example to an iOS sandbox directory:
+
+```rust
+hyperoute_core::set_static_root("/static", "/path/known/only/at/runtime");
+```
+
+**Request handling**
+
+- **Priority and methods**: dynamic routes always win, and static files are only looked up when no route matches. Only `GET` and `HEAD` are served.
+- **Directories**: `/static/docs/` serves `docs/index.html`. `/static/docs` (no trailing slash) answers `301` to `/static/docs/`, so relative links inside the page resolve correctly.
+- **Caching**: `Content-Type` comes from the file extension. `ETag` is supported, plus `Last-Modified` in disk mode, and unchanged files answer `304 Not Modified`.
+- **Security**:
+  - Hidden files and directories (names starting with `.`) are never served, and there are no directory listings.
+  - In disk mode, symlinks can't escape the root.
+  - File names are matched case-sensitively, even on case-insensitive file systems such as macOS, so debug (disk) and release (embedded) behave the same.
+- **Filters apply**: static requests pass through filters like any other request. For example, `include = ["/static/private/**"]` protects a folder.
+
+**gzip** (`.gzip(true)`) applies only to text assets: html, css, js, json, svg, xml, wasm, fonts other than woff/woff2, and similar. Files under 1 KB, or that shrink by less than 10%, stay uncompressed.
+
+- **Embedded mode**: files are compressed at build time with the best level, and **only the compressed version is stored**. It is always served with `Content-Encoding: gzip`, because browsers decompress automatically. Use `curl --compressed` when testing.
+- **Disk mode**: gzip is used only when the client sends `Accept-Encoding: gzip`. hyperoute first looks for a ready-made `app.js.gz` next to the file and serves it if it isn't older than the original. Otherwise it compresses on the first request and caches the result on disk. The cache is invalidated automatically when the file changes. You can set the cache directory with `hyperoute_core::set_static_cache_dir(...)`. `.gzip_prewarm(true)` compresses everything in the background after the first request. Files over 16 MB are never compressed at runtime; ship a `.gz` next to them instead.
+
 ## Running the server
 
 ```rust
@@ -383,6 +437,7 @@ $ curl -H 'Authorization: Bearer demo-token' http://127.0.0.1:3000/api/profile
 | `filter/access_log.rs` | Timing filter: after phase |
 | `error.rs` | A shared JSON error type |
 | `server.rs` | `serve` and a custom accept loop with `serve_connection` |
+| `static/` + `build.rs` | Static files at `/static`: sub-directories, gzip, ETag/304, and `static/private/` protected by the auth filter |
 
 Every handler has a `curl` command in its doc comment.
 

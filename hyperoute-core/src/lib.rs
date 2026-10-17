@@ -14,7 +14,9 @@ use hyper::body::{Bytes, Frame};
 mod extract;
 mod filter;
 mod param;
+mod request_path;
 mod server;
+mod static_files;
 mod websocket;
 
 pub use extract::{
@@ -25,7 +27,12 @@ pub use filter::{
     BoxError, Ext, MissingExt, Next, Request, RequestBody, Response, box_request_body, filter_applies,
     full_request_body, path_matches, read_body, take_ext, take_ext_opt,
 };
+pub use request_path::{RequestPath, normalize_path, normalize_request_path, request_path};
 pub use server::{serve, serve_connection};
+pub use static_files::{
+    EmbeddedFile, GZIP_MAX_RUNTIME_SIZE, GZIP_MIN_SIZE, StaticMount, StaticSource, content_type, is_compressible,
+    serve_static, set_static_cache_dir, set_static_root, static_init,
+};
 pub use websocket::{
     CloseFrame, Message, WebSocket, WebSocketError, WebSocketReceiver, WebSocketSender, WebSocketUpgrade,
 };

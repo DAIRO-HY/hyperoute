@@ -31,6 +31,7 @@ pub async fn get_user(id: i64, verbose: bool) -> Result<User, ApiError> {
   - 支持执行顺序、include/exclude 路径模式、中断请求。
   - 可以把登录用户等数据传给 handler（`Ext<T>`）。
 - **WebSocket**（`#[WEBSOCKET]`）：框架负责握手。handler 和普通 HTTP 路由一样能拿到路径参数、查询参数和过滤器传来的数据。
+- **静态资源**：从磁盘读取或打包进二进制，提供 html / js / css / 图片，支持 ETag/304、可选 gzip、子目录和过滤器保护。
 - **服务启动**：可以一行启动，也可以自己完全控制 accept 循环。
 
 ## Crate 组成
@@ -136,6 +137,7 @@ Hello, world!
 
 - 路径模板按 `/` 分段：写成 `{name}` 的段是路径参数，其余段必须字面相等。
 - 路径末尾的 `/` 会被忽略。
+- 每个路径段在入口处统一 percent 解码一次，过滤器匹配、路由匹配和静态资源查找都使用这同一个解码后的路径。例如 `/hello/%E4%B8%AD` 的路径参数拿到的是 `中`。包含 `..`、编码后的 `/` 或 `\` 的路径直接返回 `400`。
 - `#[REQUEST("/path")]` 匹配任意 HTTP 方法。
 - 匹配不到任何路由时返回 `404 Not Found`。
 
@@ -371,6 +373,63 @@ pub async fn chat(mut socket: WebSocket, room: String, user: Ext<CurrentUser>) -
   - `split` 拆出发送端和接收端，可以放到不同任务里，比如一个任务读客户端消息，另一个任务推送广播。
   - 对方发送 `Close` 时，框架会自动回复关闭帧，所以直接 `break` 就行。
 
+## 静态资源
+
+在 `build.rs` 里挂载 html / js / css / 图片等资源目录，子目录和 URL 路径一一对应：
+
+```rust
+use hyperoute_codegen::{Embed, StaticDir};
+
+let routes = hyperoute_codegen::Scanner::new()
+    .dir(src.join("controller"), "crate::controller")
+    .static_dir(
+        StaticDir::new("/static", manifest_dir.join("static")) // URL 前缀, 资源目录
+            .embed(Embed::Release)          // Always | Never | Release（默认）
+            .index("index.html")            // 访问目录时返回的文件（默认）
+            .spa_fallback(false)            // 未知页面路由返回 index.html（Vue/React history 模式）
+            .cache_control("no-cache")      // 可选的 Cache-Control 响应头
+            .gzip(true),                    // 压缩文本类资源（默认关闭）
+    )
+    .scan();
+```
+
+按上面的配置，`static/img/icons/logo.png` 的访问地址是 `/static/img/icons/logo.png`。
+
+**打包进二进制还是读磁盘？** 每个目录单独选择：
+
+| `Embed` | 行为 |
+|---|---|
+| `Release`（默认） | debug 编译读磁盘，改了资源刷新就生效；release 编译打包进二进制 |
+| `Always` | 始终打包。发布时只有一个二进制文件，只能访问编译时已存在的文件 |
+| `Never` | 始终在运行时读磁盘，适合很大或经常变动的资源 |
+
+- **打包模式**：文件表在编译期生成，运行时二分查找。每个请求直接返回二进制里的数据，没有 I/O，也不分配内存。资源有变化时会自动重新编译。
+- **磁盘模式**：运行时按路径查找文件，大文件流式返回。根目录默认是配置的目录，也可以在运行时改成别的目录，例如 iOS 沙盒目录：
+
+```rust
+hyperoute_core::set_static_root("/static", "/path/known/only/at/runtime");
+```
+
+**请求处理**
+
+- **优先级和方法**：动态路由永远优先，没有路由匹配时才查找静态资源。只处理 `GET` 和 `HEAD`。
+- **目录**：`/static/docs/` 返回 `docs/index.html`；`/static/docs`（没有末尾 `/`）返回 `301`，跳转到 `/static/docs/`，保证页面里的相对路径能正确解析。
+- **缓存**：`Content-Type` 按扩展名判断。支持 `ETag`，磁盘模式还支持 `Last-Modified`，文件没变时返回 `304 Not Modified`。
+- **安全**：
+  - 不提供以 `.` 开头的隐藏文件和目录，也不提供目录列表。
+  - 磁盘模式下，符号链接不能跳出根目录。
+  - 文件名严格区分大小写，即使在 macOS 这类不区分大小写的文件系统上也是如此，保证 debug（读磁盘）和 release（打包）行为一致。
+- **同样经过过滤器**：静态资源请求和其它请求一样会经过过滤器。例如 `include = ["/static/private/**"]` 可以保护一个目录。
+
+**gzip**（`.gzip(true)`）只压缩文本类资源：html、css、js、json、svg、xml、wasm、除 woff/woff2 之外的字体等。小于 1 KB 或压缩后省不到 10% 的文件不压缩。
+
+- **打包模式**：编译期用最高级别压缩，二进制里**只存压缩版**，始终带 `Content-Encoding: gzip` 返回。浏览器会自动解压；用 curl 测试时要加 `--compressed`。
+- **磁盘模式**：客户端声明支持 gzip（`Accept-Encoding: gzip`）时才压缩：
+  - 优先返回旁边现成的 `app.js.gz`，前提是它不比原文件旧。
+  - 否则第一次请求时压缩，结果缓存在磁盘上，文件变化后缓存自动失效。缓存目录可以用 `hyperoute_core::set_static_cache_dir(...)` 设置。
+  - `.gzip_prewarm(true)` 会在第一个请求之后，在后台把所有文件预先压缩好。
+  - 超过 16 MB 的文件不会在运行时压缩，可以在旁边放一个现成的 `.gz` 文件。
+
 ## 启动服务
 
 ```rust
@@ -412,6 +471,7 @@ $ curl -H 'Authorization: Bearer demo-token' http://127.0.0.1:3000/api/profile
 | `filter/access_log.rs` | 计时过滤器：after 阶段 |
 | `error.rs` | 统一的 JSON 错误类型 |
 | `server.rs` | `serve`，以及用 `serve_connection` 自己写 accept 循环 |
+| `static/` + `build.rs` | 挂在 `/static` 的静态资源：子目录、gzip、ETag/304，`static/private/` 受 auth 过滤器保护 |
 
 每个 handler 的文档注释里都附了对应的 `curl` 命令。
 

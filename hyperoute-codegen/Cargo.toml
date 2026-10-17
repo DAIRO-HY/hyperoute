@@ -14,3 +14,4 @@ categories = ["web-programming::http-server", "network-programming"]
 [dependencies]
 syn = { version = "3", features = ["full", "extra-traits"] }
 quote = "1"
+flate2 = "1"
