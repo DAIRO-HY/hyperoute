@@ -1,0 +1,11 @@
+[workspace]
+members = ["hyperoute-core", "hyperoute-macro", "hyperoute-codegen", "hyperoute-sample"]
+resolver = "3"
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/DAIRO-HY/hyperoute"
+homepage = "https://github.com/DAIRO-HY/hyperoute"

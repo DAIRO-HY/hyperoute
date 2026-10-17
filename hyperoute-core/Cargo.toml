@@ -1,0 +1,31 @@
+[package]
+name = "hyperoute-core"
+description = "Runtime for hyperoute: request extraction, parameter errors, filters, WebSocket and server helpers."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../README.md"
+keywords = ["hyper", "http", "web", "router", "annotation"]
+categories = ["web-programming::http-server", "network-programming"]
+
+[dependencies]
+hyper = { version = "1", features = ["full"] }
+http-body-util = "0.1"
+futures-util = { version = "0.3", default-features = false, features = ["alloc", "sink"] }
+multer = "3"
+tokio = { version = "1", features = ["fs", "net", "rt", "time"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+serde = "1"
+serde_json = "1"
+serde_urlencoded = "0.7"
+serde_path_to_error = "0.1"
+form_urlencoded = "1"
+
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["fs", "macros", "rt", "rt-multi-thread"] }
+tokio-tungstenite = { version = "0.30", features = ["connect"] }

@@ -1,0 +1,15 @@
+[package]
+name = "hyperoute-macro"
+description = "Route / filter / WebSocket attribute macros (#[GET], #[FILTER], #[WEBSOCKET], ...) for hyperoute."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../README.md"
+keywords = ["hyper", "http", "web", "router", "annotation"]
+categories = ["web-programming::http-server", "network-programming"]
+
+[lib]
+proc-macro = true

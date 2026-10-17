@@ -1,0 +1,23 @@
+[package]
+name = "hyperoute-sample"
+description = "Example application for the hyperoute framework."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+hyperoute-core = { path = "../hyperoute-core" }
+hyperoute-macro = { path = "../hyperoute-macro" }
+# 生成的路由代码会直接用到下面这几个 crate
+hyper = { version = "1", features = ["full"] }
+http-body-util = "0.1"
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+# 示例代码自己用到的
+serde = { version = "1", features = ["derive"] }
+tokio-util = { version = "0.7", features = ["io"] }
+
+[build-dependencies]
+hyperoute-codegen = { path = "../hyperoute-codegen" }

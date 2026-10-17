@@ -1,0 +1,16 @@
+[package]
+name = "hyperoute-codegen"
+description = "Build-time route scanner and code generator for hyperoute, used from build.rs."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../README.md"
+keywords = ["hyper", "http", "web", "router", "annotation"]
+categories = ["web-programming::http-server", "network-programming"]
+
+[dependencies]
+syn = { version = "3", features = ["full", "extra-traits"] }
+quote = "1"
