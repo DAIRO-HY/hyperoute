@@ -8,8 +8,10 @@ license.workspace = true
 publish = false
 
 [dependencies]
-hyperoute-core = { path = "../hyperoute-core" }
-hyperoute-macro = { path = "../hyperoute-macro" }
+#hyperoute-core = { path = "../hyperoute-core" }
+hyperoute-core = "0.0.1"
+#hyperoute-macro = { path = "../hyperoute-macro" }
+hyperoute-macro = "0.0.1"
 # 生成的路由代码会直接用到下面这几个 crate
 hyper = { version = "1", features = ["full"] }
 http-body-util = "0.1"
@@ -20,4 +22,5 @@ serde = { version = "1", features = ["derive"] }
 tokio-util = { version = "0.7", features = ["io"] }
 
 [build-dependencies]
-hyperoute-codegen = { path = "../hyperoute-codegen" }
+#hyperoute-codegen = { path = "../hyperoute-codegen" }
+hyperoute-codegen = "0.0.1"

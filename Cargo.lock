@@ -303,8 +303,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyperoute-codegen"
+version = "0.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a011730d42e056aa61bc6fe810622192bd5263d5e271ff2dc9202ed3e47d0ccf"
+dependencies = [
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "hyperoute-core"
 version = "0.0.1"
+dependencies = [
+ "form_urlencoded",
+ "futures-util",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "multer",
+ "serde",
+ "serde_json",
+ "serde_path_to_error",
+ "serde_urlencoded",
+ "tokio",
+ "tokio-tungstenite",
+]
+
+[[package]]
+name = "hyperoute-core"
+version = "0.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d96b37b2dd8c729fcc7317a0596db1855f6cf0b4fe0e440dbb5570f0ea9a9050"
 dependencies = [
  "form_urlencoded",
  "futures-util",
@@ -325,14 +355,20 @@ name = "hyperoute-macro"
 version = "0.0.1"
 
 [[package]]
+name = "hyperoute-macro"
+version = "0.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0979585dd0a38ff1f726ba35472caf0f7df4dc9e61d4637654e641745e6f9f89"
+
+[[package]]
 name = "hyperoute-sample"
 version = "0.0.1"
 dependencies = [
  "http-body-util",
  "hyper",
- "hyperoute-codegen",
- "hyperoute-core",
- "hyperoute-macro",
+ "hyperoute-codegen 0.0.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "hyperoute-core 0.0.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "hyperoute-macro 0.0.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde",
  "serde_json",
  "tokio",
