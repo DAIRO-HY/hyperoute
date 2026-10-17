@@ -42,8 +42,8 @@ pub async fn get_user(id: i64, verbose: bool) -> Result<User, ApiError> {
 
 ```toml
 [dependencies]
-hyperoute-core = "0.0.2"
-hyperoute-macro = "0.0.2"
+hyperoute-core = "0.0.3"
+hyperoute-macro = "0.0.3"
 # The generated router uses these crates directly:
 hyper = { version = "1", features = ["full"] }
 http-body-util = "0.1"
@@ -53,7 +53,7 @@ tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 
 [build-dependencies]
-hyperoute-codegen = "0.0.2"
+hyperoute-codegen = "0.0.3"
 ```
 
 **2. `build.rs`**: scan your handler directories and write the router into `OUT_DIR`
@@ -138,9 +138,29 @@ Each handler parameter's source is decided from its name and type:
 |---|---|---|
 | Name matches a `{name}` in the path | Path segment, converted with `FromStr` | `#[GET("/users/{id}")] fn f(id: i64)` |
 | Scalar type: integers, floats, `bool`, `char`, `String`, `&str` | Query string `?name=value` | `fn f(page: u32, keyword: String)` |
+| `Query<T>` | The whole query string, deserialized into struct `T`, for any HTTP method | `fn f(q: Query<Search>)` |
 | `Ext<T>` / `Option<Ext<T>>` | Data inserted by a [filter](#filters) | `fn f(user: Ext<CurrentUser>)` |
 | `WebSocket` | Only in [`#[WEBSOCKET]`](#websocket) routes | `fn f(socket: WebSocket)` |
 | Any other type | Request body, chosen by `content-type` | `fn f(form: UserForm)` |
+
+**Query struct (`Query<T>`).** Bind the query string to a struct instead of listing every parameter. `T` must implement `Deserialize`. Use `Option<_>` or `#[serde(default)]` for optional parameters. It works with any HTTP method, and it can be combined with scalar query parameters and a request body, since the same query string can feed several parameters:
+
+```rust
+#[derive(Deserialize)]
+pub struct UserInfo { pub name: String, pub age: u8, pub nickname: Option<String> }
+
+// GET /users?id=10&name=AA&age=10
+#[GET("/users")]
+pub async fn find(id: i64, info: Query<UserInfo>) -> String {
+    format!("{id} {} {}", info.name, info.age) // Query<T> derefs to T
+}
+
+// POST /users?name=AA&age=10, with a JSON / form body bound to `form`
+#[POST("/users")]
+pub async fn create(info: Query<UserInfo>, form: UserForm) -> String { /* ... */ }
+```
+
+Errors are reported as query parameters, for example `Query parameter "age" is invalid, got "x".`. The same parameter appearing more than once (`?tag=a&tag=b`) can't be bound to a `Vec` yet.
 
 **Request body**
 

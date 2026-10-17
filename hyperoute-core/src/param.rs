@@ -152,6 +152,7 @@ impl ParamError {
     /// 默认文案里这个参数的称呼，例如 `Query parameter "id"`。
     fn subject(&self) -> String {
         match (&self.param, self.location) {
+            (None, ParamLocation::Query) => "Query string".to_string(),
             (None, _) => "Request body".to_string(),
             (Some(p), ParamLocation::Path) => format!("Path parameter \"{}\"", escape(p)),
             (Some(p), ParamLocation::Query) => format!("Query parameter \"{}\"", escape(p)),

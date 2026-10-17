@@ -87,6 +87,8 @@ enum ParamSource {
     Ext { name: String, optional: bool },
     /// `#[WEBSOCKET]` 路由里的 `WebSocket` 参数：握手完成后由框架传入
     WebSocket { name: String },
+    /// `Query<T>`：整个查询串解析到结构体 T（不论请求方法）；`inner_type` 只用于日志
+    QueryStruct { name: String, inner_type: String },
 }
 
 impl ParamSource {
@@ -96,7 +98,8 @@ impl ParamSource {
             | ParamSource::Query(name, _)
             | ParamSource::Body { name, .. }
             | ParamSource::Ext { name, .. }
-            | ParamSource::WebSocket { name } => name,
+            | ParamSource::WebSocket { name }
+            | ParamSource::QueryStruct { name, .. } => name,
         }
     }
 }
@@ -434,6 +437,11 @@ fn classify_params(
             let name = pat_ident.ident.to_string();
             if type_last_ident_is(&pat_type.ty, "WebSocket") {
                 Some(ParamSource::WebSocket { name })
+            } else if type_last_ident_is(&pat_type.ty, "Query") {
+                let inner_type = single_generic_arg(&pat_type.ty)
+                    .map(|inner| type_to_string(&inner))
+                    .unwrap_or_else(|| type_to_string(&pat_type.ty));
+                Some(ParamSource::QueryStruct { name, inner_type })
             } else if let Some(optional) = ext_param_kind(&pat_type.ty) {
                 Some(ParamSource::Ext { name, optional })
             } else if path_names.contains(&name.as_str()) {
@@ -836,6 +844,12 @@ fn write_route_arm(out: &mut String, route: &RouteInfo) {
         );
     }
     for param in &route.params {
+        if let ParamSource::QueryStruct { name, inner_type } = param {
+            let _ = writeln!(
+                setup,
+                "            let {name} = __try_param!({label:?}, hyperoute_core::query_struct(req.uri().query(), {inner_type:?}));"
+            );
+        }
         if let ParamSource::Ext { name, optional } = param {
             if *optional {
                 let _ = writeln!(
@@ -854,7 +868,7 @@ fn write_route_arm(out: &mut String, route: &RouteInfo) {
 
     for param in &route.params {
         match param {
-            ParamSource::Ext { .. } | ParamSource::WebSocket { .. } => {}
+            ParamSource::Ext { .. } | ParamSource::WebSocket { .. } | ParamSource::QueryStruct { .. } => {}
             ParamSource::Path(name, ty) => {
                 if ty.is_str_ref {
                     // match 模式里绑定的是 `&&str`，这里解一层引用即可，不需要转换

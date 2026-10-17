@@ -49,8 +49,8 @@ pub async fn get_user(id: i64, verbose: bool) -> Result<User, ApiError> {
 
 ```toml
 [dependencies]
-hyperoute-core = "0.0.2"
-hyperoute-macro = "0.0.2"
+hyperoute-core = "0.0.3"
+hyperoute-macro = "0.0.3"
 # 生成的路由代码会直接用到下面这几个 crate：
 hyper = { version = "1", features = ["full"] }
 http-body-util = "0.1"
@@ -60,7 +60,7 @@ tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 
 [build-dependencies]
-hyperoute-codegen = "0.0.2"
+hyperoute-codegen = "0.0.3"
 ```
 
 **2. `build.rs`**：扫描 handler 所在目录，把生成的路由代码写到 `OUT_DIR`
@@ -149,9 +149,32 @@ Hello, world!
 |---|---|---|
 | 参数名和路径里的 `{name}` 相同 | 路径段，用 `FromStr` 转换 | `#[GET("/users/{id}")] fn f(id: i64)` |
 | 标量类型：整数、浮点数、`bool`、`char`、`String`、`&str` | 查询串 `?name=value` | `fn f(page: u32, keyword: String)` |
+| `Query<T>` | 整个查询串，解析到结构体 `T`，不区分请求方法 | `fn f(q: Query<Search>)` |
 | `Ext<T>` / `Option<Ext<T>>` | [过滤器](#过滤器)放进请求的数据 | `fn f(user: Ext<CurrentUser>)` |
 | `WebSocket` | 只能用在 [`#[WEBSOCKET]`](#websocket) 路由 | `fn f(socket: WebSocket)` |
 | 其它类型 | 请求体，按 `content-type` 解析 | `fn f(form: UserForm)` |
+
+**查询串结构体（`Query<T>`）。** 可以把查询串绑定到一个结构体上，不用把每个参数都列成函数参数：
+- `T` 需要实现 `Deserialize`，可选参数用 `Option<_>` 或 `#[serde(default)]`。
+- 任何请求方法都能用。
+- 可以和标量查询参数、请求体参数同时使用，同一个查询串可以同时提供给多个参数。
+
+```rust
+#[derive(Deserialize)]
+pub struct UserInfo { pub name: String, pub age: u8, pub nickname: Option<String> }
+
+// GET /users?id=10&name=AA&age=10
+#[GET("/users")]
+pub async fn find(id: i64, info: Query<UserInfo>) -> String {
+    format!("{id} {} {}", info.name, info.age) // Query<T> 实现了 Deref，可以直接访问字段
+}
+
+// POST /users?name=AA&age=10，JSON / 表单请求体绑定到 `form`
+#[POST("/users")]
+pub async fn create(info: Query<UserInfo>, form: UserForm) -> String { /* ... */ }
+```
+
+解析失败时按查询参数报错，例如 `Query parameter "age" is invalid, got "x".`。同名参数出现多次（`?tag=a&tag=b`）暂时还不能绑定到 `Vec`。
 
 **请求体**
 

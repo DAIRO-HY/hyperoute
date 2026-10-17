@@ -8,9 +8,11 @@ use std::num::{IntErrorKind, ParseIntError};
 use std::str::FromStr;
 
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use serde_path_to_error::{Path, Segment};
 
 use crate::MultipartField;
+use crate::filter::Query;
 use crate::param::{ParamError, ParamErrorKind, ParamLocation};
 
 /// 把一个字符串参数（路径段 / 查询值 / multipart 文本字段）转换成目标类型。
@@ -116,10 +118,26 @@ fn json_error(path: Option<&Path>, err: &serde_json::Error, expected_type: &'sta
 
 /// 按 `application/x-www-form-urlencoded` 反序列化请求体。
 pub fn urlencoded_body<'de, T: Deserialize<'de>>(bytes: &'de [u8], expected_type: &'static str) -> Result<T, ParamError> {
+    urlencoded_struct(bytes, ParamLocation::Body, expected_type)
+}
+
+/// [`Query<T>`] 参数：把整个查询串（不论请求方法）反序列化到结构体 `T`。
+/// 没有查询串时按空串处理（全是 `Option` / `#[serde(default)]` 字段的结构体可以成功）。
+/// `T` 必须是 `DeserializeOwned`：查询串属于请求，而请求体参数会在之后消费掉整个请求。
+pub fn query_struct<T: DeserializeOwned>(query: Option<&str>, expected_type: &'static str) -> Result<Query<T>, ParamError> {
+    urlencoded_struct(query.unwrap_or("").as_bytes(), ParamLocation::Query, expected_type).map(Query)
+}
+
+/// urlencoded 格式（表单请求体 / 查询串共用）反序列化，失败时定位到具体字段并回显原始值。
+fn urlencoded_struct<'de, T: Deserialize<'de>>(
+    bytes: &'de [u8],
+    location: ParamLocation,
+    expected_type: &'static str,
+) -> Result<T, ParamError> {
     let de = serde_urlencoded::Deserializer::new(form_urlencoded::parse(bytes));
     serde_path_to_error::deserialize(de).map_err(|e| {
         let message = e.inner().to_string();
-        let mut error = data_error(ParamLocation::Body, Some(e.path()), &message);
+        let mut error = data_error(location, Some(e.path()), &message);
         // urlencoded 的值都是字符串，可以按字段名把客户端传的原始值找回来用于回显
         if error.kind != ParamErrorKind::Missing {
             if let Some(key) = single_map_key(e.path()) {
@@ -240,6 +258,31 @@ mod tests {
 
         let e = json_body::<Form>(br#"{"id": 1,"#, "Form").unwrap_err();
         assert_eq!(e.kind, ParamErrorKind::MalformedBody);
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[allow(dead_code)]
+    struct Search {
+        name: String,
+        age: u8,
+        tag: Option<String>,
+    }
+
+    #[test]
+    fn query_struct_binding() {
+        // 其它查询参数（例如同时被标量参数使用的 id）不影响结构体
+        let q = query_struct::<Search>(Some("id=10&name=A%20A&age=10"), "Search").unwrap();
+        assert_eq!((q.name.as_str(), q.age, q.tag.as_deref()), ("A A", 10, None));
+
+        let e = query_struct::<Search>(Some("name=AA&age=x"), "Search").unwrap_err();
+        assert_eq!(e.location, ParamLocation::Query);
+        assert_eq!(e.to_string(), r#"Query parameter "age" is invalid, got "x"."#);
+
+        let e = query_struct::<Search>(Some("name=AA&age=300"), "Search").unwrap_err();
+        assert_eq!(e.kind, ParamErrorKind::OutOfRange);
+
+        let e = query_struct::<Search>(None, "Search").unwrap_err();
+        assert_eq!(e.to_string(), r#"Query parameter "name" is required."#);
     }
 
     #[test]

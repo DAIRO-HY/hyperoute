@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use hyperoute_core::MultipartFile;
+use hyperoute_core::{MultipartFile, Query};
 use hyperoute_macro::{GET, POST};
 use serde::{Deserialize, Serialize};
 
@@ -19,6 +19,23 @@ pub async fn path_param(id: i64) -> String {
 #[GET("/params/query")]
 pub async fn query_params(id: i64, name: String) -> String {
     format!("id = {id}, name = {name}")
+}
+
+/// `Query<T>` → 整个查询串解析到结构体（不论请求方法），可以和标量查询参数同时使用：
+/// 这里 `id` 和 `info` 都从同一个查询串取值。可选参数用 `Option`。
+/// curl "http://127.0.0.1:3000/params/query_struct?id=10&name=AA&age=10"
+/// curl "http://127.0.0.1:3000/params/query_struct?id=10&name=AA&age=10&nickname=bob"
+#[GET("/params/query_struct")]
+pub async fn query_struct(id: i64, info: Query<UserInfo>) -> String {
+    // Query<T> 实现了 Deref，可以直接访问字段
+    format!("id = {id}, name = {}, age = {}, nickname = {:?}", info.name, info.age, info.nickname)
+}
+
+/// POST 请求同样可以用 `Query<T>` 接收查询串，同时用另一个参数接收请求体。
+/// curl -X POST -d 'id=1&name=alice&age=30' "http://127.0.0.1:3000/params/form_with_query?name=AA&age=10"
+#[POST("/params/form_with_query")]
+pub async fn form_with_query(info: Query<UserInfo>, form: UserForm) -> String {
+    format!("query = {:?}, form = {form:?}", *info)
 }
 
 /// 其它类型 → 请求体，按 content-type 选择 JSON / urlencoded / multipart。
@@ -48,6 +65,14 @@ pub async fn upload(form: UploadForm<'_>) -> String {
 
 // 请求体结构体要和使用它的 handler 定义在同一个文件里（可以嵌套在 mod 里），
 // 代码生成时才能看到它的字段，从而支持 multipart/form-data。
+
+/// `Query<UserInfo>` 用的结构体，需要实现 `Deserialize`。
+#[derive(Debug, Deserialize)]
+pub struct UserInfo {
+    pub name: String,
+    pub age: u8,
+    pub nickname: Option<String>,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UserForm {

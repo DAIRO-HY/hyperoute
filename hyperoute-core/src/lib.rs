@@ -21,10 +21,10 @@ mod websocket;
 
 pub use extract::{
     body_read_error, json_body, multipart_take, multipart_text, parse_param, query_map, query_param,
-    query_param_str, unsupported_content_type, urlencoded_body,
+    query_param_str, query_struct, unsupported_content_type, urlencoded_body,
 };
 pub use filter::{
-    BoxError, Ext, MissingExt, Next, Request, RequestBody, Response, box_request_body, filter_applies,
+    BoxError, Ext, MissingExt, Next, Query, Request, RequestBody, Response, box_request_body, filter_applies,
     full_request_body, path_matches, read_body, take_ext, take_ext_opt,
 };
 pub use request_path::{RequestPath, normalize_path, normalize_request_path, request_path};

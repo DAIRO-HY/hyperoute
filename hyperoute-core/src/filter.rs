@@ -99,6 +99,32 @@ impl<T> DerefMut for Ext<T> {
     }
 }
 
+/// controller 参数：把查询串（`?a=1&b=2`）解析到结构体 `T`，不论请求方法（GET / POST / ...）。
+/// `T` 需要实现 `serde::Deserialize`，可选参数用 `Option<_>` 或 `#[serde(default)]`。
+/// 可以和标量查询参数（`id: i64`）、请求体参数同时使用。
+#[derive(Debug, Clone)]
+pub struct Query<T>(pub T);
+
+impl<T> Query<T> {
+    pub fn into_inner(self) -> T {
+        self.0
+    }
+}
+
+impl<T> Deref for Query<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T> DerefMut for Query<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.0
+    }
+}
+
 /// [`take_ext`] 找不到数据时的错误；只进服务端日志，不会返回给客户端。
 #[derive(Debug)]
 pub struct MissingExt {
