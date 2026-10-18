@@ -42,8 +42,8 @@ pub async fn get_user(id: i64, verbose: bool) -> Result<User, ApiError> {
 
 ```toml
 [dependencies]
-hyperoute-core = "0.0.4"
-hyperoute-macro = "0.0.4"
+hyperoute-core = "0.0.5"
+hyperoute-macro = "0.0.5"
 # The generated router uses these crates directly:
 hyper = { version = "1", features = ["full"] }
 http-body-util = "0.1"
@@ -53,7 +53,7 @@ tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 
 [build-dependencies]
-hyperoute-codegen = "0.0.4"
+hyperoute-codegen = "0.0.5"
 ```
 
 **2. `build.rs`**: scan your handler directories and write the router into `OUT_DIR`
@@ -161,6 +161,29 @@ pub async fn create(info: Query<UserInfo>, form: UserForm) -> String { /* ... */
 ```
 
 Errors are reported as query parameters, for example `Query parameter "age" is invalid, got "x".`. The same parameter appearing more than once (`?tag=a&tag=b`) can't be bound to a `Vec` yet.
+
+**Parameter naming (camelCase front ends).** Front ends usually send camelCase names (`pageSize`), while Rust uses snake_case (`page_size`). How each kind of parameter handles this:
+
+| Parameter | How names are matched |
+|---|---|
+| JSON / urlencoded body, `Query<T>`, JSON responses | serde attributes on the struct: `#[serde(rename_all = "camelCase")]`, `rename`, `alias` |
+| Scalar query parameters (`fn f(page_size: u32)`) | The `ParamNaming` switch in `build.rs` |
+| multipart fields | serde attributes if the struct has any `rename_all` / `rename` / `alias`, so JSON and multipart agree. Otherwise the `ParamNaming` switch. Structs with file fields can't derive serde, so they use the switch. |
+
+```rust
+// build.rs
+hyperoute_codegen::Scanner::new()
+    .dir(src.join("controller"), "crate::controller")
+    .param_naming(ParamNaming::CamelCase)   // default: ParamNaming::Exact
+    .scan();
+```
+
+With `ParamNaming::CamelCase`:
+- **Both names are accepted.** `fn list(page_size: u32, sort_by: String)` accepts `?pageSize=20&sortBy=name` as well as `?page_size=20&sort_by=name`. If both appear, the Rust name wins.
+- **The camelCase name is computed at build time**, so there is no string conversion at runtime. Names without an underscore (`id`, `name`) generate exactly the same code as before.
+- **Error messages use the camelCase name**, e.g. `Query parameter "pageSize" is required.`.
+
+To make a whole API camelCase, put `#[serde(rename_all = "camelCase")]` on request and response structs, and turn on `ParamNaming::CamelCase` for scalar parameters.
 
 **Request body**
 

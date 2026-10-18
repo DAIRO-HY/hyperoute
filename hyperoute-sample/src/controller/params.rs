@@ -21,6 +21,15 @@ pub async fn query_params(id: i64, name: String) -> String {
     format!("id = {id}, name = {name}")
 }
 
+/// build.rs 里开启了 `ParamNaming::CamelCase`：snake_case 参数名同时接受前端的驼峰写法（原名优先），
+/// 驼峰名在编译期算好，运行时没有额外的字符串转换。
+/// curl "http://127.0.0.1:3000/params/naming?pageSize=20&sortBy=name"
+/// curl "http://127.0.0.1:3000/params/naming?page_size=20&sort_by=name"
+#[GET("/params/naming")]
+pub async fn naming(page_size: u32, sort_by: String) -> String {
+    format!("page_size = {page_size}, sort_by = {sort_by}")
+}
+
 /// `Query<T>` → 整个查询串解析到结构体（不论请求方法），可以和标量查询参数同时使用：
 /// 这里 `id` 和 `info` 都从同一个查询串取值。可选参数用 `Option`。
 /// curl "http://127.0.0.1:3000/params/query_struct?id=10&name=AA&age=10"
@@ -45,6 +54,15 @@ pub async fn form_with_query(info: Query<UserInfo>, form: UserForm) -> String {
 #[POST("/params/form")]
 pub async fn submit_form(form: UserForm) -> String {
     format!("form = {form:?}")
+}
+
+/// 结构体带 serde 改名属性时，JSON / urlencoded / multipart 都按 serde 的规则取字段名（这里是驼峰），
+/// 不受 build.rs 里 `ParamNaming` 开关的影响，保证同一个结构体在各种 content-type 下一致。
+/// curl -F userId=1 -F nickName=alice http://127.0.0.1:3000/params/profile
+/// curl -X POST -H 'content-type: application/json' -d '{"userId":1,"nickName":"alice"}' http://127.0.0.1:3000/params/profile
+#[POST("/params/profile")]
+pub async fn profile(form: ProfileForm) -> String {
+    format!("user_id = {}, nick_name = {}", form.user_id, form.nick_name)
 }
 
 /// 含文件字段的结构体只支持 multipart/form-data。
@@ -79,6 +97,13 @@ pub struct UserForm {
     pub id: i64,
     pub name: String,
     pub age: u8,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileForm {
+    pub user_id: i64,
+    pub nick_name: String,
 }
 
 /// 只走 multipart/form-data，不需要 Serialize / Deserialize：

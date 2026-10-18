@@ -5,11 +5,13 @@
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
-use syn::{FieldsNamed, FnArg, Item, ItemFn, Pat, ReturnType};
+use syn::{FnArg, Item, ItemFn, Pat, ReturnType};
 
 mod html_include;
+mod naming;
 mod static_dir;
 
+pub use naming::ParamNaming;
 pub use static_dir::{Embed, StaticDir};
 
 /// 所有识别的属性名；REQUEST 表示匹配任意 HTTP 方法。
@@ -67,16 +69,16 @@ enum FieldKind {
 struct BodyStructInfo {
     /// struct 的完整可调用路径，例如 "crate::controller::index::model::SampleInForm"
     full_path: String,
-    /// 按声明顺序排列的 (字段名, 取值方式, 字段类型原文)
-    fields: Vec<(String, FieldKind, String)>,
+    /// 按声明顺序排列的 (字段名, 取值方式, 字段类型原文, multipart 里的名字)
+    fields: Vec<(String, FieldKind, String, naming::WireName)>,
 }
 
 #[derive(Debug, Clone)]
 enum ParamSource {
     /// 值来自路径段，绑定名与路径里的 `{name}` 一致
     Path(String, TypeInfo),
-    /// 值来自 URL 查询串（`?name=value`），按参数名取值后 `.parse()`
-    Query(String, TypeInfo),
+    /// 值来自 URL 查询串（`?name=value`），按参数名取值后 `.parse()`；第三项是请求里的名字（受 ParamNaming 影响）
+    Query(String, TypeInfo, naming::WireName),
     /// 值来自请求体；`struct_info` 是 Some 时才支持 multipart/form-data
     /// （要求这个类型的 struct 定义能在同一份源文件里找到，可以嵌套在 `mod {}` 里）
     Body {
@@ -96,7 +98,7 @@ impl ParamSource {
     fn name(&self) -> &str {
         match self {
             ParamSource::Path(name, _)
-            | ParamSource::Query(name, _)
+            | ParamSource::Query(name, _, _)
             | ParamSource::Body { name, .. }
             | ParamSource::Ext { name, .. }
             | ParamSource::WebSocket { name }
@@ -170,6 +172,7 @@ struct Collected {
 pub struct Scanner {
     dirs: Vec<(PathBuf, String)>,
     statics: Vec<StaticDir>,
+    param_naming: ParamNaming,
 }
 
 impl Scanner {
@@ -183,6 +186,14 @@ impl Scanner {
         self
     }
 
+    /// 标量查询参数（`fn f(page_size: u32)`）和没有 serde 改名属性的 multipart 字段接受哪些参数名，
+    /// 默认 [`ParamNaming::Exact`]。`ParamNaming::CamelCase` 时 `page_size` 也接受前端的 `pageSize`。
+    /// 驼峰名在编译期算好，运行时不做字符串转换。JSON / urlencoded / `Query<T>` 由 serde 决定，不受影响。
+    pub fn param_naming(mut self, naming: ParamNaming) -> Self {
+        self.param_naming = naming;
+        self
+    }
+
     /// 挂载一个静态资源目录，可以挂多个；没有动态路由匹配时才查找静态资源。
     pub fn static_dir(mut self, dir: StaticDir) -> Self {
         self.statics.push(dir);
@@ -193,7 +204,7 @@ impl Scanner {
     pub fn scan(&self) -> RouteTable {
         let mut collected = Collected::default();
         for (dir, module) in &self.dirs {
-            scan_dir(dir, module, &mut collected);
+            scan_dir(dir, module, &mut collected, self.param_naming);
         }
 
         let mut handlers = collected.param_error_handlers;
@@ -225,7 +236,7 @@ pub fn scan_routes(root: &Path, root_mod: &str) -> RouteTable {
     Scanner::new().dir(root, root_mod).scan()
 }
 
-fn scan_dir(dir: &Path, mod_path: &str, collected: &mut Collected) {
+fn scan_dir(dir: &Path, mod_path: &str, collected: &mut Collected, naming: ParamNaming) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -235,19 +246,19 @@ fn scan_dir(dir: &Path, mod_path: &str, collected: &mut Collected) {
         if path.is_dir() {
             let name = path.file_name().unwrap().to_string_lossy().into_owned();
             let child_mod = format!("{mod_path}::{name}");
-            scan_dir(&path, &child_mod, collected);
+            scan_dir(&path, &child_mod, collected, naming);
         } else if path.extension().is_some_and(|ext| ext == "rs") {
             let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
             if stem == "mod" {
                 continue; // mod.rs 本身不含 handler
             }
             let file_mod = format!("{mod_path}::{stem}");
-            scan_file(&path, &file_mod, collected);
+            scan_file(&path, &file_mod, collected, naming);
         }
     }
 }
 
-fn scan_file(path: &Path, mod_path: &str, collected: &mut Collected) {
+fn scan_file(path: &Path, mod_path: &str, collected: &mut Collected, naming: ParamNaming) {
     let Ok(content) = fs::read_to_string(path) else {
         return;
     };
@@ -284,7 +295,7 @@ fn scan_file(path: &Path, mod_path: &str, collected: &mut Collected) {
             };
 
             let segments = parse_path_template(&lit.value());
-            let params = classify_params(item_fn, &segments, &file, mod_path);
+            let params = classify_params(item_fn, &segments, &file, mod_path, naming);
             let (is_result, return_kind) = classify_return(&item_fn.sig.output);
             validate_websocket_params(&fn_path, websocket, item_fn, &params);
 
@@ -327,7 +338,7 @@ fn validate_websocket_params(fn_path: &str, websocket: bool, item_fn: &ItemFn, p
             ParamSource::Body { name, .. } => {
                 panic!("#[WEBSOCKET] 函数不能有请求体参数 `{name}`（握手是 GET 请求，没有 body）：{fn_path}")
             }
-            ParamSource::Path(name, ty) | ParamSource::Query(name, ty) if ty.is_str_ref => {
+            ParamSource::Path(name, ty) | ParamSource::Query(name, ty, _) if ty.is_str_ref => {
                 panic!("#[WEBSOCKET] 函数的参数 `{name}` 不能是 &str，请改用 String（handler 在后台任务里运行）：{fn_path}")
             }
             _ => {}
@@ -415,6 +426,7 @@ fn classify_params(
     segments: &[PathSegment],
     file: &syn::File,
     file_mod_path: &str,
+    naming: ParamNaming,
 ) -> Vec<ParamSource> {
     let path_names: Vec<&str> = segments
         .iter()
@@ -449,9 +461,10 @@ fn classify_params(
                 Some(ParamSource::Path(name, type_info(&pat_type.ty)))
             } else if is_scalar_type(&pat_type.ty) {
                 // 标量类型（数字/布尔/字符串）且不是路径参数 => 来自 URL 查询串 `?name=value`
-                Some(ParamSource::Query(name, type_info(&pat_type.ty)))
+                let wire = naming::for_param(&name, naming);
+                Some(ParamSource::Query(name, type_info(&pat_type.ty), wire))
             } else {
-                let struct_info = resolve_body_struct(file, file_mod_path, &pat_type.ty);
+                let struct_info = resolve_body_struct(file, file_mod_path, &pat_type.ty, naming);
                 Some(ParamSource::Body {
                     name,
                     rust_type: type_to_string(&pat_type.ty),
@@ -539,20 +552,31 @@ fn type_to_string(ty: &syn::Type) -> String {
 
 /// 在同一份文件里（可以嵌套在 `mod {}` 里）找 `ty` 对应的 struct 定义，
 /// 拿到它的完整路径和字段列表。找不到就返回 None（那这个 body 参数就不支持 multipart）。
-fn resolve_body_struct(file: &syn::File, file_mod_path: &str, ty: &syn::Type) -> Option<BodyStructInfo> {
+fn resolve_body_struct(
+    file: &syn::File,
+    file_mod_path: &str,
+    ty: &syn::Type,
+    naming: ParamNaming,
+) -> Option<BodyStructInfo> {
     let syn::Type::Path(type_path) = ty else {
         return None;
     };
     let name = type_path.path.segments.last()?.ident.to_string();
-    let (mod_suffix, fields_named) = find_struct(&file.items, "", &name)?;
+    let (mod_suffix, item_struct) = find_struct(&file.items, "", &name)?;
+    let syn::Fields::Named(fields_named) = &item_struct.fields else {
+        return None;
+    };
 
     let full_path = format!("{file_mod_path}{mod_suffix}::{name}");
+    // multipart 里的字段名：有 serde 改名属性按 serde，否则按 ParamNaming 开关
+    let wire_names = naming::struct_field_names(item_struct, naming, &full_path);
     let fields = fields_named
         .named
         .iter()
-        .filter_map(|f| {
+        .zip(wire_names)
+        .filter_map(|(f, wire)| {
             let field_name = f.ident.as_ref()?.to_string();
-            Some((field_name, classify_field_kind(&f.ty), type_to_string(&f.ty)))
+            Some((field_name, classify_field_kind(&f.ty), type_to_string(&f.ty), wire))
         })
         .collect();
 
@@ -563,12 +587,12 @@ fn find_struct<'a>(
     items: &'a [Item],
     mod_prefix: &str,
     name: &str,
-) -> Option<(String, &'a FieldsNamed)> {
+) -> Option<(String, &'a syn::ItemStruct)> {
     for item in items {
         match item {
             Item::Struct(item_struct) if item_struct.ident == name => {
-                if let syn::Fields::Named(named) = &item_struct.fields {
-                    return Some((mod_prefix.to_string(), named));
+                if let syn::Fields::Named(_) = &item_struct.fields {
+                    return Some((mod_prefix.to_string(), item_struct));
                 }
             }
             Item::Mod(item_mod) => {
@@ -883,7 +907,25 @@ fn write_route_arm(out: &mut String, route: &RouteInfo) {
                     );
                 }
             }
-            ParamSource::Query(name, ty) => {
+            ParamSource::Query(name, ty, wire) if !wire.is_plain(name) => {
+                // ParamNaming::CamelCase：按编译期算好的候选名依次查找（原名优先）
+                let keys = wire.lookup_literal();
+                let display = &wire.display;
+                if ty.is_str_ref {
+                    let _ = writeln!(
+                        setup,
+                        "            let {name} = __try_param!({label:?}, hyperoute_core::query_param_str_any(&__query_map, {keys}, {display:?}));"
+                    );
+                } else {
+                    let _ = writeln!(
+                        setup,
+                        "            let {name} = __try_param!({label:?}, hyperoute_core::query_param_any(&__query_map, {keys}, {display:?}, {expected}, {rust_type:?}));",
+                        expected = expected_literal(ty.expected),
+                        rust_type = ty.rust_type,
+                    );
+                }
+            }
+            ParamSource::Query(name, ty, _) => {
                 if ty.is_str_ref {
                     let _ = writeln!(
                         setup,
@@ -1096,7 +1138,7 @@ fn write_body_setup(
     );
 
     let has_file_field = struct_info.is_some_and(|info| {
-        info.fields.iter().any(|(_, kind, _)| !matches!(kind, FieldKind::Plain(_)))
+        info.fields.iter().any(|(_, kind, _, _)| !matches!(kind, FieldKind::Plain(_)))
     });
 
     if has_file_field {
@@ -1139,16 +1181,22 @@ fn render_multipart_branch(label: &str, info: &BodyStructInfo) -> (String, Strin
     );
 
     let mut ctor_fields = Vec::new();
-    for (field_name, kind, rust_type) in &info.fields {
+    for (field_name, kind, rust_type, wire) in &info.fields {
         ctor_fields.push(field_name.clone());
+        // 字段名就是 Rust 名字时沿用单名字版本；否则按编译期算好的候选名依次查找
+        let (take_fn, text_fn, keys) = if wire.is_plain(field_name) {
+            ("multipart_take", "multipart_text", format!("{field_name:?}"))
+        } else {
+            ("multipart_take_any", "multipart_text_any", format!("{}, {:?}", wire.lookup_literal(), wire.display))
+        };
         let take = format!(
-            "__try_param!({label:?}, hyperoute_core::multipart_take(&mut __fields, {field_name:?}, {rust_type:?}))"
+            "__try_param!({label:?}, hyperoute_core::{take_fn}(&mut __fields, {keys}, {rust_type:?}))"
         );
         match kind {
             FieldKind::Plain(ty) => {
                 let _ = writeln!(
                     out,
-                    "                let {field_name} = __try_param!({label:?}, hyperoute_core::multipart_text(&mut __fields, {field_name:?}, {expected}, {rust_type:?}));",
+                    "                let {field_name} = __try_param!({label:?}, hyperoute_core::{text_fn}(&mut __fields, {keys}, {expected}, {rust_type:?}));",
                     expected = expected_literal(ty.expected),
                 );
             }

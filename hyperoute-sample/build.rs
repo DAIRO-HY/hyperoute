@@ -2,7 +2,7 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
-use hyperoute_codegen::{Embed, StaticDir};
+use hyperoute_codegen::{Embed, ParamNaming, StaticDir};
 
 /// 扫描 src/controller、src/filter 下的注解并挂载 static 目录，生成 `$OUT_DIR/routes.rs`，
 /// 由 src/server.rs `include!` 进来。
@@ -13,6 +13,8 @@ fn main() {
     let routes = hyperoute_codegen::Scanner::new()
         .dir(src_dir.join("controller"), "crate::controller")
         .dir(src_dir.join("filter"), "crate::filter")
+        // 标量查询参数和 multipart 字段同时接受驼峰写法：fn f(page_size: u32) 也能收到 ?pageSize=20
+        .param_naming(ParamNaming::CamelCase)
         // static/ 挂在 /static 下：debug 编译读磁盘（改了刷新就生效），release 编译打包进二进制
         .static_dir(
             StaticDir::new("/static", manifest_dir.join("static"))

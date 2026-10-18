@@ -21,8 +21,9 @@ mod static_files;
 mod websocket;
 
 pub use extract::{
-    body_read_error, json_body, multipart_take, multipart_text, parse_param, query_map, query_param,
-    query_param_str, query_struct, unsupported_content_type, urlencoded_body,
+    body_read_error, json_body, multipart_take, multipart_take_any, multipart_text, multipart_text_any, parse_param,
+    query_map, query_param, query_param_any, query_param_str, query_param_str_any, query_struct,
+    unsupported_content_type, urlencoded_body,
 };
 pub use filter::{
     BoxError, Ext, MissingExt, Next, Query, Request, RequestBody, Response, box_request_body, filter_applies,

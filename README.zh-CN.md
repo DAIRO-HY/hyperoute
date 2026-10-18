@@ -49,8 +49,8 @@ pub async fn get_user(id: i64, verbose: bool) -> Result<User, ApiError> {
 
 ```toml
 [dependencies]
-hyperoute-core = "0.0.4"
-hyperoute-macro = "0.0.4"
+hyperoute-core = "0.0.5"
+hyperoute-macro = "0.0.5"
 # 生成的路由代码会直接用到下面这几个 crate：
 hyper = { version = "1", features = ["full"] }
 http-body-util = "0.1"
@@ -60,7 +60,7 @@ tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 
 [build-dependencies]
-hyperoute-codegen = "0.0.4"
+hyperoute-codegen = "0.0.5"
 ```
 
 **2. `build.rs`**：扫描 handler 所在目录，把生成的路由代码写到 `OUT_DIR`
@@ -175,6 +175,29 @@ pub async fn create(info: Query<UserInfo>, form: UserForm) -> String { /* ... */
 ```
 
 解析失败时按查询参数报错，例如 `Query parameter "age" is invalid, got "x".`。同名参数出现多次（`?tag=a&tag=b`）暂时还不能绑定到 `Vec`。
+
+**参数命名（前端用驼峰）。** 前端通常用驼峰命名（`pageSize`），Rust 用下划线命名（`page_size`）。各类参数的处理方式如下：
+
+| 参数类型 | 名字怎么匹配 |
+|---|---|
+| JSON / urlencoded 请求体、`Query<T>`、JSON 响应 | 看结构体上的 serde 属性：`#[serde(rename_all = "camelCase")]`、`rename`、`alias` |
+| 标量查询参数（`fn f(page_size: u32)`） | 看 `build.rs` 里的 `ParamNaming` 开关 |
+| multipart 字段 | 结构体上有 `rename_all` / `rename` / `alias` 中的任何一个时，按 serde 属性，保证和 JSON 一致；否则按 `ParamNaming` 开关。含文件字段的结构体无法派生 serde，所以总是按开关 |
+
+```rust
+// build.rs
+hyperoute_codegen::Scanner::new()
+    .dir(src.join("controller"), "crate::controller")
+    .param_naming(ParamNaming::CamelCase)   // 默认：ParamNaming::Exact
+    .scan();
+```
+
+开启 `ParamNaming::CamelCase` 后：
+- **两种写法都能接收**：`fn list(page_size: u32, sort_by: String)` 既能接收 `?pageSize=20&sortBy=name`，也能接收 `?page_size=20&sort_by=name`。两种写法同时出现时，以 Rust 原名为准。
+- **驼峰名在编译期就算好**，运行时不做任何字符串转换。没有下划线的参数名（`id`、`name`）生成的代码和以前完全一样。
+- **错误信息里显示驼峰名**，例如 `Query parameter "pageSize" is required.`。
+
+想让整套接口都用驼峰：请求和响应的结构体都加上 `#[serde(rename_all = "camelCase")]`，标量参数再打开 `ParamNaming::CamelCase`。
 
 **请求体**
 

@@ -61,18 +61,44 @@ where
     T: FromStr,
     T::Err: Display + 'static,
 {
-    let Some(raw) = query.get(name) else {
-        return Err(ParamError::missing(ParamLocation::Query, name).with_expected(expected, expected_type));
+    query_param_any(query, &[name], name, expected, expected_type)
+}
+
+/// 按候选名依次查找查询参数（例如 `["page_size", "pageSize"]`，前面的优先）。
+/// 候选名由 hyperoute-codegen 在编译期按 `ParamNaming` 算好；`display` 是缺失时错误信息里的名字，
+/// 值不合法时错误信息用实际匹配到的那个名字。
+pub fn query_param_any<T>(
+    query: &HashMap<String, String>,
+    keys: &[&str],
+    display: &str,
+    expected: Option<&'static str>,
+    expected_type: &'static str,
+) -> Result<T, ParamError>
+where
+    T: FromStr,
+    T::Err: Display + 'static,
+{
+    let Some((key, raw)) = keys.iter().find_map(|key| query.get(*key).map(|raw| (*key, raw))) else {
+        return Err(ParamError::missing(ParamLocation::Query, display).with_expected(expected, expected_type));
     };
-    parse_param(ParamLocation::Query, name, raw, expected, expected_type)
+    parse_param(ParamLocation::Query, key, raw, expected, expected_type)
 }
 
 /// `&str` 类型的查询参数：不需要转换，只检查是否存在。
 pub fn query_param_str<'a>(query: &'a HashMap<String, String>, name: &str) -> Result<&'a str, ParamError> {
-    query
-        .get(name)
+    query_param_str_any(query, &[name], name)
+}
+
+/// `&str` 版本的 [`query_param_any`]。
+pub fn query_param_str_any<'a>(
+    query: &'a HashMap<String, String>,
+    keys: &[&str],
+    display: &str,
+) -> Result<&'a str, ParamError> {
+    keys.iter()
+        .find_map(|key| query.get(*key))
         .map(String::as_str)
-        .ok_or_else(|| ParamError::missing(ParamLocation::Query, name).with_expected(Some("string"), "&str"))
+        .ok_or_else(|| ParamError::missing(ParamLocation::Query, display).with_expected(Some("string"), "&str"))
 }
 
 /// 请求体的 content-type 这个路由不支持。
@@ -196,9 +222,23 @@ pub fn multipart_take(
     name: &str,
     expected_type: &'static str,
 ) -> Result<MultipartField, ParamError> {
-    fields.remove(name).ok_or_else(|| {
-        ParamError::missing(ParamLocation::MultipartField, name).with_expected(Some("file"), expected_type)
+    multipart_take_any(fields, &[name], name, expected_type)
+}
+
+/// 按候选名依次取出 multipart 字段（前面的优先），用法同 [`query_param_any`]。
+pub fn multipart_take_any(
+    fields: &mut HashMap<String, MultipartField>,
+    keys: &[&str],
+    display: &str,
+    expected_type: &'static str,
+) -> Result<MultipartField, ParamError> {
+    take_any(fields, keys).map(|(_, field)| field).ok_or_else(|| {
+        ParamError::missing(ParamLocation::MultipartField, display).with_expected(Some("file"), expected_type)
     })
+}
+
+fn take_any<'k>(fields: &mut HashMap<String, MultipartField>, keys: &[&'k str]) -> Option<(&'k str, MultipartField)> {
+    keys.iter().find_map(|key| fields.remove(*key).map(|field| (*key, field)))
 }
 
 /// 取出一个 multipart 文本字段并转换成目标类型。
@@ -212,8 +252,23 @@ where
     T: FromStr,
     T::Err: Display + 'static,
 {
-    let Some(field) = fields.remove(name) else {
-        return Err(ParamError::missing(ParamLocation::MultipartField, name).with_expected(expected, expected_type));
+    multipart_text_any(fields, &[name], name, expected, expected_type)
+}
+
+/// 按候选名依次取出 multipart 文本字段并转换（前面的优先），用法同 [`query_param_any`]。
+pub fn multipart_text_any<T>(
+    fields: &mut HashMap<String, MultipartField>,
+    keys: &[&str],
+    display: &str,
+    expected: Option<&'static str>,
+    expected_type: &'static str,
+) -> Result<T, ParamError>
+where
+    T: FromStr,
+    T::Err: Display + 'static,
+{
+    let Some((name, field)) = take_any(fields, keys) else {
+        return Err(ParamError::missing(ParamLocation::MultipartField, display).with_expected(expected, expected_type));
     };
     let text = String::from_utf8(field.data).map_err(|e| {
         // 非 UTF-8 的内容不回显
@@ -266,6 +321,26 @@ mod tests {
         name: String,
         age: u8,
         tag: Option<String>,
+    }
+
+    #[test]
+    fn lookup_by_candidate_names() {
+        let query: HashMap<String, String> =
+            [("pageSize", "20"), ("page_size", "10"), ("sortBy", "x")].map(|(k, v)| (k.to_string(), v.to_string())).into();
+        // 原名优先
+        assert_eq!(query_param_any::<u32>(&query, &["page_size", "pageSize"], "pageSize", None, "u32").unwrap(), 10);
+        assert_eq!(query_param_str_any(&query, &["sort_by", "sortBy"], "sortBy").unwrap(), "x");
+        // 缺失时用 display 名；值不合法时用实际匹配到的名字
+        let e = query_param_any::<u32>(&query, &["limit_num", "limitNum"], "limitNum", None, "u32").unwrap_err();
+        assert_eq!(e.param.as_deref(), Some("limitNum"));
+        let e = query_param_any::<u32>(&query, &["sort_by", "sortBy"], "sortBy", Some("integer"), "u32").unwrap_err();
+        assert_eq!(e.to_string(), r#"Query parameter "sortBy" must be an integer, got "x"."#);
+
+        let field = |v: &str| MultipartField { file_name: None, content_type: None, data: v.as_bytes().to_vec() };
+        let mut fields: HashMap<String, MultipartField> = [("userId".to_string(), field("7"))].into();
+        assert_eq!(multipart_text_any::<i64>(&mut fields, &["user_id", "userId"], "userId", None, "i64").unwrap(), 7);
+        let e = multipart_take_any(&mut fields, &["avatar_file", "avatarFile"], "avatarFile", "Vec<u8>").err().unwrap();
+        assert_eq!(e.to_string(), r#"Form field "avatarFile" is required."#);
     }
 
     #[test]
