@@ -47,7 +47,7 @@ pub(crate) fn for_param(rust_name: &str, naming: ParamNaming) -> WireName {
     match naming {
         ParamNaming::Exact => WireName::exact(rust_name),
         ParamNaming::CamelCase => {
-            let camel = rename_case("camelCase", rust_name).unwrap();
+            let camel = param_camel_case(rust_name);
             if camel == rust_name {
                 // 没有下划线的名字驼峰写法和原名相同：只查一次，和不开启时一样
                 WireName::exact(rust_name)
@@ -56,6 +56,26 @@ pub(crate) fn for_param(rust_name: &str, naming: ParamNaming) -> WireName {
             }
         }
     }
+}
+
+/// `ParamNaming::CamelCase` 的驼峰名：`page_size` → `pageSize`，前导下划线保留（`_client_flag` → `_clientFlag`）。
+/// 和 serde 的 `rename_all = "camelCase"` 不同（serde 会去掉前导下划线）；和 hyperoute-core 的 `param_camel_case` 一致。
+pub(crate) fn param_camel_case(name: &str) -> String {
+    let rest = name.trim_start_matches('_');
+    let mut out = String::with_capacity(name.len());
+    out.push_str(&name[..name.len() - rest.len()]);
+    let mut capitalize = false;
+    for ch in rest.chars() {
+        if ch == '_' {
+            capitalize = true;
+        } else if capitalize {
+            out.extend(ch.to_uppercase());
+            capitalize = false;
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 /// serde `rename_all` 对字段名的转换（和 serde_derive 的规则一致）；不认识的取值返回 None。
@@ -209,6 +229,9 @@ mod tests {
         assert_eq!(camel.display, "pageSize");
         assert!(for_param("id", ParamNaming::CamelCase).is_plain("id"));
         assert_eq!(for_param("user_id2", ParamNaming::CamelCase).display, "userId2");
+        // 前导下划线保留（DFS 的 `_clientFlag`）
+        assert_eq!(for_param("_client_flag", ParamNaming::CamelCase).lookup, ["_client_flag", "_clientFlag"]);
+        assert!(for_param("_token", ParamNaming::CamelCase).is_plain("_token"));
     }
 
     #[test]

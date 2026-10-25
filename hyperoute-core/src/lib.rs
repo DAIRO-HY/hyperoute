@@ -4,16 +4,20 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures_util::{Stream as FutureStream, StreamExt};
 use http_body_util::{BodyExt, Full, StreamBody, combinators::BoxBody};
 use hyper::StatusCode;
 use hyper::body::{Bytes, Frame};
 
+mod body_stream;
 mod extract;
+mod file_response;
 mod filter;
+mod form;
 mod html_include;
+mod limits;
+mod multipart;
 mod param;
 mod request_path;
 mod server;
@@ -25,12 +29,23 @@ pub use extract::{
     query_map, query_param, query_param_any, query_param_str, query_param_str_any, query_struct,
     unsupported_content_type, urlencoded_body,
 };
+pub use body_stream::BodyStream;
+pub use limits::{
+    DEFAULT_MULTIPART_MEMORY_LIMIT, max_body_size, multipart_memory_limit, set_max_body_size, set_multipart_memory_limit,
+    set_upload_temp_dir, upload_temp_dir,
+};
+pub use multipart::{TempFile, payload_too_large, read_body_limited, read_multipart_fields, read_multipart_list};
+pub use file_response::content_disposition;
+pub use form::{
+    FormData, FormOptions, FormRequest, form_opt, form_opt_str, form_str, form_struct, form_value, form_vec,
+    form_vec_lenient, lenient, lenient_opt, param_camel_case,
+};
 pub use filter::{
     BoxError, Ext, MissingExt, Next, Query, Request, RequestBody, Response, box_request_body, filter_applies,
     full_request_body, path_matches, read_body, take_ext, take_ext_opt,
 };
 pub use request_path::{RequestPath, normalize_path, normalize_request_path, request_path};
-pub use server::{serve, serve_connection};
+pub use server::{MissingRemoteAddr, RemoteAddr, serve, serve_connection, serve_connection_with_addr};
 pub use static_files::{
     EmbeddedFile, GZIP_MAX_RUNTIME_SIZE, GZIP_MIN_SIZE, StaticMount, StaticSource, content_type, is_compressible,
     serve_static, set_static_cache_dir, set_static_root, static_init,
@@ -92,6 +107,8 @@ pub fn boxed_full(body: Full<Bytes>) -> ResponseBody {
 /// `headers` 用 `Vec` 而不是 `HashMap`：允许同名 header 出现多次（例如 `Set-Cookie`），
 /// 并保留调用方追加时的顺序。
 pub struct Raw {
+    /// 响应状态码，默认 200
+    pub status: StatusCode,
     pub headers: Vec<(&'static str, String)>,
     pub body: Vec<u8>,
 }
@@ -99,9 +116,16 @@ pub struct Raw {
 impl Raw {
     pub fn new(body: impl Into<Vec<u8>>) -> Self {
         Self {
+            status: StatusCode::OK,
             headers: Vec::new(),
             body: body.into(),
         }
+    }
+
+    /// 设置状态码，例如 `.status(StatusCode::CREATED)`。
+    pub fn status(mut self, status: StatusCode) -> Self {
+        self.status = status;
+        self
     }
 
     /// 链式追加一个 header，例如 `.header("content-type", "image/png")`。
@@ -115,6 +139,8 @@ impl Raw {
 /// handler 想返回一个边读边发的流式响应（大文件、转发别的接口的字节流等）时用这个包装类型；
 /// hyperoute-codegen 按类型名 `Stream` 识别它，header API 跟 [`Raw`] 保持一致。
 pub struct Stream {
+    /// 响应状态码，默认 200
+    pub status: StatusCode,
     pub headers: Vec<(&'static str, String)>,
     pub body: ResponseBody,
 }
@@ -130,9 +156,16 @@ impl Stream {
         let frames = chunks.map(|chunk| chunk.map(Frame::data));
         let body = BodyExt::boxed(StreamBody::new(frames));
         Self {
+            status: StatusCode::OK,
             headers: Vec::new(),
             body,
         }
+    }
+
+    /// 设置状态码，例如 `.status(StatusCode::PARTIAL_CONTENT)`。
+    pub fn status(mut self, status: StatusCode) -> Self {
+        self.status = status;
+        self
     }
 
     /// 链式追加一个 header，用法和 [`Raw::header`] 一致。
@@ -157,10 +190,17 @@ pub struct MultipartFile<T> {
 
 /// `multipart/form-data` 里解析出的一个字段，交给 hyperoute-codegen 生成的代码
 /// 按 struct 字段类型分别处理（普通值 / `Vec<u8>` / `&Path` / `MultipartFile<T>`）。
+///
+/// 文件字段超过 multipart 内存阈值后转存到临时文件（`spooled`），这时 `data` 为空；
+/// 用 [`MultipartField::into_bytes`] / [`MultipartField::into_temp_file`] 取内容，不必关心存在哪里。
+#[derive(Debug)]
 pub struct MultipartField {
     pub file_name: Option<String>,
     pub content_type: Option<String>,
+    /// 内存里的内容；已经转存到临时文件时为空
     pub data: Vec<u8>,
+    /// 转存的临时文件（drop 时删除）
+    pub spooled: Option<TempFile>,
 }
 
 /// 解析 `multipart/form-data` 请求体，按字段名建索引。
@@ -169,6 +209,14 @@ pub async fn parse_multipart(
     body: Bytes,
     content_type: &str,
 ) -> Result<HashMap<String, MultipartField>, ParamError> {
+    Ok(parse_multipart_list(body, content_type).await?.into_iter().collect())
+}
+
+/// 解析 `multipart/form-data` 请求体，按出现顺序返回全部字段（同名字段都保留）。
+pub async fn parse_multipart_list(
+    body: Bytes,
+    content_type: &str,
+) -> Result<Vec<(String, MultipartField)>, ParamError> {
     let malformed = |reason: multer::Error| {
         ParamError::new(ParamLocation::Body, None, ParamErrorKind::MalformedBody)
             .with_detail("invalid multipart/form-data")
@@ -180,7 +228,7 @@ pub async fn parse_multipart(
     let stream = futures_util::stream::once(async move { Ok::<Bytes, Infallible>(body) });
     let mut multipart = multer::Multipart::new(stream, boundary);
 
-    let mut fields = HashMap::new();
+    let mut fields = Vec::new();
     while let Some(field) = multipart.next_field().await.map_err(malformed)? {
         let Some(name) = field.name().map(|s| s.to_string()) else {
             continue;
@@ -188,26 +236,25 @@ pub async fn parse_multipart(
         let file_name = field.file_name().map(|s| s.to_string());
         let field_content_type = field.content_type().map(|m| m.to_string());
         let data = field.bytes().await.map_err(malformed)?.to_vec();
-        fields.insert(
+        fields.push((
             name,
             MultipartField {
                 file_name,
                 content_type: field_content_type,
                 data,
+                spooled: None,
             },
-        );
+        ));
     }
     Ok(fields)
 }
 
-static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// 把上传的文件内容写到系统临时目录下的一个新文件里，返回它的路径。
-/// 注意：不会自动清理——长期运行的服务如果大量走这条路径，需要自己加一个清理策略。
-/// 写入失败是服务端的问题，生成代码会返回 [`internal_error_response`]，而不是参数错误。
+/// 把内容写到系统临时目录下的一个新文件里，返回它的路径。
+/// 注意：返回的文件**不会**自动删除（生成代码用的是请求结束时自动删除的 [`TempFile`]）。
 pub async fn write_temp_file(data: &[u8]) -> std::io::Result<PathBuf> {
-    let n = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!("hyperoute-upload-{}-{n}", std::process::id()));
-    tokio::fs::write(&path, data).await?;
-    Ok(path)
+    use tokio::io::AsyncWriteExt;
+    let (temp, mut file) = TempFile::create().await?;
+    file.write_all(data).await?;
+    file.flush().await?;
+    Ok(temp.keep())
 }

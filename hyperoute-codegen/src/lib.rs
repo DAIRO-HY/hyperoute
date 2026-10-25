@@ -9,9 +9,12 @@ use syn::{FnArg, Item, ItemFn, Pat, ReturnType};
 
 mod html_include;
 mod naming;
+mod options;
 mod static_dir;
 
 pub use naming::ParamNaming;
+pub use options::{ParamBinding, ParamFallback};
+use options::ScanOptions;
 pub use static_dir::{Embed, StaticDir};
 
 /// 所有识别的属性名；REQUEST 表示匹配任意 HTTP 方法。
@@ -38,6 +41,19 @@ enum PathSegment {
     Literal(String),
     /// `{name}`
     Param(String),
+    /// `{*name}`：剩下的 1 个或多个路径段，只能是最后一段
+    Rest(String),
+}
+
+/// 标量参数 / 表单字段的形态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Shape {
+    /// `T`
+    One,
+    /// `Option<T>`
+    Opt,
+    /// `Vec<T>`
+    Many,
 }
 
 /// 参数 / 字段类型在生成代码里需要的信息。
@@ -55,8 +71,8 @@ struct TypeInfo {
 /// 只有能在同一份源文件里找到 struct 定义时才会算出这个，用来支持 multipart/form-data。
 #[derive(Debug, Clone)]
 enum FieldKind {
-    /// 普通值类型（String/数字等），当文本字段处理
-    Plain(TypeInfo),
+    /// 普通值类型（String/数字等），当文本字段处理；TypeInfo 是去掉 Option / Vec 外壳后的类型
+    Plain(TypeInfo, Shape),
     /// `Vec<u8>`：整个文件内容直接放进这个字段
     RawBytes,
     /// `&Path`：文件内容写到临时文件，字段拿到这个临时文件的路径
@@ -77,8 +93,11 @@ struct BodyStructInfo {
 enum ParamSource {
     /// 值来自路径段，绑定名与路径里的 `{name}` 一致
     Path(String, TypeInfo),
-    /// 值来自 URL 查询串（`?name=value`），按参数名取值后 `.parse()`；第三项是请求里的名字（受 ParamNaming 影响）
-    Query(String, TypeInfo, naming::WireName),
+    /// `{*name}`：剩下的路径段用 `/` 拼起来；`index` 是它在模板里的段序号
+    RestPath { name: String, ty: TypeInfo, index: usize },
+    /// 标量参数（`T` / `Option<T>` / `Vec<T>`）：默认从查询串取值，合并模式从合并后的表单取值；
+    /// `ty` 是去掉 Option / Vec 外壳后的类型，`wire` 是请求里的名字（受 ParamNaming 影响）
+    Query { name: String, ty: TypeInfo, wire: naming::WireName, shape: Shape },
     /// 值来自请求体；`struct_info` 是 Some 时才支持 multipart/form-data
     /// （要求这个类型的 struct 定义能在同一份源文件里找到，可以嵌套在 `mod {}` 里）
     Body {
@@ -92,17 +111,30 @@ enum ParamSource {
     WebSocket { name: String },
     /// `Query<T>`：整个查询串解析到结构体 T（不论请求方法）；`inner_type` 只用于日志
     QueryStruct { name: String, inner_type: String },
+    /// `HeaderMap`（复制一份）或 `&HeaderMap`
+    Headers { name: String, by_ref: bool },
+    /// `RemoteAddr` 或 `Option<RemoteAddr>`
+    RemoteAddr { name: String, optional: bool },
+    /// `BodyStream`：未缓冲的请求体
+    BodyStream { name: String },
+    /// handler 直接写的 multipart 文件参数：`MultipartFile<Vec<u8>>` / `MultipartFile<&Path>`
+    File { name: String, kind: FieldKind, rust_type: String, wire: naming::WireName },
 }
 
 impl ParamSource {
     fn name(&self) -> &str {
         match self {
             ParamSource::Path(name, _)
-            | ParamSource::Query(name, _, _)
+            | ParamSource::RestPath { name, .. }
+            | ParamSource::Query { name, .. }
             | ParamSource::Body { name, .. }
             | ParamSource::Ext { name, .. }
             | ParamSource::WebSocket { name }
-            | ParamSource::QueryStruct { name, .. } => name,
+            | ParamSource::QueryStruct { name, .. }
+            | ParamSource::Headers { name, .. }
+            | ParamSource::RemoteAddr { name, .. }
+            | ParamSource::BodyStream { name }
+            | ParamSource::File { name, .. } => name,
         }
     }
 }
@@ -121,6 +153,19 @@ pub struct RouteInfo {
     return_kind: ReturnKind,
     /// `#[WEBSOCKET]` 路由：握手后在后台调用 handler，返回值不进响应
     websocket: bool,
+    /// `ParamBinding::Merged`
+    merged: bool,
+    /// 参数缺失 / 转换失败时用默认值（全局 `ParamFallback` 或 handler 上的属性）
+    lenient: bool,
+    /// `ParamNaming::CamelCase`（表单结构体在运行时也接受字段的驼峰名）
+    camel: bool,
+}
+
+impl RouteInfo {
+    /// 带 `{*name}` 的路由排在普通路由后面，固定段多的优先。
+    fn rest_index(&self) -> Option<usize> {
+        self.segments.iter().position(|s| matches!(s, PathSegment::Rest(_)))
+    }
 }
 
 /// `#[PARAM_ERROR]` 标注的参数错误响应函数。
@@ -172,7 +217,7 @@ struct Collected {
 pub struct Scanner {
     dirs: Vec<(PathBuf, String)>,
     statics: Vec<StaticDir>,
-    param_naming: ParamNaming,
+    options: ScanOptions,
 }
 
 impl Scanner {
@@ -190,7 +235,21 @@ impl Scanner {
     /// 默认 [`ParamNaming::Exact`]。`ParamNaming::CamelCase` 时 `page_size` 也接受前端的 `pageSize`。
     /// 驼峰名在编译期算好，运行时不做字符串转换。JSON / urlencoded / `Query<T>` 由 serde 决定，不受影响。
     pub fn param_naming(mut self, naming: ParamNaming) -> Self {
-        self.param_naming = naming;
+        self.options.naming = naming;
+        self
+    }
+
+    /// 标量参数和表单结构体从哪里取值，默认 [`ParamBinding::Separate`]（标量只看查询串）。
+    /// [`ParamBinding::Merged`] 时和 Go 的 `request.Form` 一致，查询串和表单请求体合并后取值。
+    pub fn param_binding(mut self, binding: ParamBinding) -> Self {
+        self.options.binding = binding;
+        self
+    }
+
+    /// 参数缺失或转换失败时的处理，默认 [`ParamFallback::Strict`]（返回参数错误）。
+    /// handler 上的 `#[PARAM_STRICT]` / `#[PARAM_LENIENT]` 覆盖这个设置。
+    pub fn param_fallback(mut self, fallback: ParamFallback) -> Self {
+        self.options.fallback = fallback;
         self
     }
 
@@ -204,7 +263,7 @@ impl Scanner {
     pub fn scan(&self) -> RouteTable {
         let mut collected = Collected::default();
         for (dir, module) in &self.dirs {
-            scan_dir(dir, module, &mut collected, self.param_naming);
+            scan_dir(dir, module, &mut collected, self.options);
         }
 
         let mut handlers = collected.param_error_handlers;
@@ -236,7 +295,7 @@ pub fn scan_routes(root: &Path, root_mod: &str) -> RouteTable {
     Scanner::new().dir(root, root_mod).scan()
 }
 
-fn scan_dir(dir: &Path, mod_path: &str, collected: &mut Collected, naming: ParamNaming) {
+fn scan_dir(dir: &Path, mod_path: &str, collected: &mut Collected, options: ScanOptions) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -246,19 +305,19 @@ fn scan_dir(dir: &Path, mod_path: &str, collected: &mut Collected, naming: Param
         if path.is_dir() {
             let name = path.file_name().unwrap().to_string_lossy().into_owned();
             let child_mod = format!("{mod_path}::{name}");
-            scan_dir(&path, &child_mod, collected, naming);
+            scan_dir(&path, &child_mod, collected, options);
         } else if path.extension().is_some_and(|ext| ext == "rs") {
             let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
             if stem == "mod" {
                 continue; // mod.rs 本身不含 handler
             }
             let file_mod = format!("{mod_path}::{stem}");
-            scan_file(&path, &file_mod, collected, naming);
+            scan_file(&path, &file_mod, collected, options);
         }
     }
 }
 
-fn scan_file(path: &Path, mod_path: &str, collected: &mut Collected, naming: ParamNaming) {
+fn scan_file(path: &Path, mod_path: &str, collected: &mut Collected, options: ScanOptions) {
     let Ok(content) = fs::read_to_string(path) else {
         return;
     };
@@ -269,6 +328,7 @@ fn scan_file(path: &Path, mod_path: &str, collected: &mut Collected, naming: Par
     for item in &file.items {
         let Item::Fn(item_fn) = item else { continue };
         let fn_path = format!("{mod_path}::{}", item_fn.sig.ident);
+        let lenient = route_lenient(item_fn, &fn_path, options.fallback);
 
         for attr in &item_fn.attrs {
             let Some(ident) = attr.path().get_ident() else {
@@ -294,10 +354,11 @@ fn scan_file(path: &Path, mod_path: &str, collected: &mut Collected, naming: Par
                 continue;
             };
 
-            let segments = parse_path_template(&lit.value());
-            let params = classify_params(item_fn, &segments, &file, mod_path, naming);
+            let segments = parse_path_template(&lit.value(), &fn_path);
+            let params = classify_params(item_fn, &segments, &file, mod_path, options.naming);
             let (is_result, return_kind) = classify_return(&item_fn.sig.output);
             validate_websocket_params(&fn_path, websocket, item_fn, &params);
+            validate_body_params(&fn_path, options.binding, &params);
 
             collected.routes.push(RouteInfo {
                 label: format!("{method} {}", lit.value()),
@@ -309,6 +370,9 @@ fn scan_file(path: &Path, mod_path: &str, collected: &mut Collected, naming: Par
                 is_result,
                 return_kind,
                 websocket,
+                merged: options.binding == ParamBinding::Merged,
+                lenient,
+                camel: options.naming == ParamNaming::CamelCase,
             });
         }
     }
@@ -338,11 +402,51 @@ fn validate_websocket_params(fn_path: &str, websocket: bool, item_fn: &ItemFn, p
             ParamSource::Body { name, .. } => {
                 panic!("#[WEBSOCKET] 函数不能有请求体参数 `{name}`（握手是 GET 请求，没有 body）：{fn_path}")
             }
-            ParamSource::Path(name, ty) | ParamSource::Query(name, ty, _) if ty.is_str_ref => {
+            ParamSource::Path(name, ty) | ParamSource::RestPath { name, ty, .. } | ParamSource::Query { name, ty, .. }
+                if ty.is_str_ref =>
+            {
                 panic!("#[WEBSOCKET] 函数的参数 `{name}` 不能是 &str，请改用 String（handler 在后台任务里运行）：{fn_path}")
+            }
+            ParamSource::Headers { name, by_ref: true } => {
+                panic!("#[WEBSOCKET] 函数的参数 `{name}` 不能是 &HeaderMap，请改用 HeaderMap（handler 在后台任务里运行）：{fn_path}")
+            }
+            ParamSource::File { name, .. } | ParamSource::BodyStream { name } => {
+                panic!("#[WEBSOCKET] 函数不能有请求体参数 `{name}`（握手是 GET 请求，没有 body）：{fn_path}")
             }
             _ => {}
         }
+    }
+}
+
+/// 请求体相关参数的组合检查：
+/// - `BodyStream` 最多一个，不能和请求体结构体、文件参数同时出现（请求体只能读一次）；
+/// - 默认模式下文件参数不能和请求体结构体同时出现（各自读取请求体）；合并模式下请求体只读一次，可以同时出现。
+fn validate_body_params(fn_path: &str, binding: ParamBinding, params: &[ParamSource]) {
+    let streams = params.iter().filter(|p| matches!(p, ParamSource::BodyStream { .. })).count();
+    let has_body = params.iter().any(|p| matches!(p, ParamSource::Body { .. }));
+    let has_file = params.iter().any(|p| matches!(p, ParamSource::File { .. }));
+    if streams > 1 {
+        panic!("一个 handler 最多只能有一个 BodyStream 参数：{fn_path}");
+    }
+    if streams == 1 && (has_body || has_file) {
+        panic!("BodyStream 参数不能和请求体结构体 / multipart 文件参数同时使用（请求体只能读一次）：{fn_path}");
+    }
+    if binding == ParamBinding::Separate && has_body && has_file {
+        panic!(
+            "默认模式下 multipart 文件参数不能和请求体结构体参数同时使用，请把文件字段放进结构体，或者开启 ParamBinding::Merged：{fn_path}"
+        );
+    }
+}
+
+/// handler 上的 `#[PARAM_STRICT]` / `#[PARAM_LENIENT]` 覆盖全局的 `ParamFallback`。
+fn route_lenient(item_fn: &ItemFn, fn_path: &str, fallback: ParamFallback) -> bool {
+    let strict = item_fn.attrs.iter().any(|a| a.path().is_ident("PARAM_STRICT"));
+    let lenient = item_fn.attrs.iter().any(|a| a.path().is_ident("PARAM_LENIENT"));
+    match (strict, lenient) {
+        (true, true) => panic!("#[PARAM_STRICT] 和 #[PARAM_LENIENT] 不能同时使用：{fn_path}"),
+        (true, false) => false,
+        (false, true) => true,
+        (false, false) => fallback == ParamFallback::Default,
     }
 }
 
@@ -409,14 +513,24 @@ fn parse_pattern_list(expr: &syn::Expr) -> syn::Result<Vec<String>> {
         .collect()
 }
 
-fn parse_path_template(path: &str) -> Vec<PathSegment> {
-    path.split('/')
+fn parse_path_template(path: &str, fn_path: &str) -> Vec<PathSegment> {
+    let segments: Vec<PathSegment> = path
+        .split('/')
         .filter(|s| !s.is_empty())
         .map(|seg| match seg.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
-            Some(name) => PathSegment::Param(name.to_string()),
+            Some(name) => match name.strip_prefix('*') {
+                Some(rest) => PathSegment::Rest(rest.to_string()),
+                None => PathSegment::Param(name.to_string()),
+            },
             None => PathSegment::Literal(seg.to_string()),
         })
-        .collect()
+        .collect();
+    if let Some(index) = segments.iter().position(|s| matches!(s, PathSegment::Rest(_))) {
+        if index + 1 != segments.len() {
+            panic!("尾部通配参数 {{*name}} 只能写在路径模板的最后一段：{path}（{fn_path}）");
+        }
+    }
+    segments
 }
 
 /// 按函数签名参数顺序，判断每个参数是来自路径段还是请求体；
@@ -432,9 +546,13 @@ fn classify_params(
         .iter()
         .filter_map(|s| match s {
             PathSegment::Param(name) => Some(name.as_str()),
-            PathSegment::Literal(_) => None,
+            PathSegment::Literal(_) | PathSegment::Rest(_) => None,
         })
         .collect();
+    let rest = segments.iter().enumerate().find_map(|(index, s)| match s {
+        PathSegment::Rest(name) => Some((name.as_str(), index)),
+        _ => None,
+    });
 
     item_fn
         .sig
@@ -457,12 +575,31 @@ fn classify_params(
                 Some(ParamSource::QueryStruct { name, inner_type })
             } else if let Some(optional) = ext_param_kind(&pat_type.ty) {
                 Some(ParamSource::Ext { name, optional })
+            } else if let Some(by_ref) = header_map_kind(&pat_type.ty) {
+                Some(ParamSource::Headers { name, by_ref })
+            } else if let Some(optional) = wrapped_kind(&pat_type.ty, "RemoteAddr") {
+                Some(ParamSource::RemoteAddr { name, optional })
+            } else if type_last_ident_is(&pat_type.ty, "BodyStream") {
+                Some(ParamSource::BodyStream { name })
             } else if path_names.contains(&name.as_str()) {
                 Some(ParamSource::Path(name, type_info(&pat_type.ty)))
-            } else if is_scalar_type(&pat_type.ty) {
-                // 标量类型（数字/布尔/字符串）且不是路径参数 => 来自 URL 查询串 `?name=value`
+            } else if let Some((_, index)) = rest.filter(|(rest_name, _)| *rest_name == name) {
+                Some(ParamSource::RestPath { ty: type_info(&pat_type.ty), name, index })
+            } else if let Some((shape, inner)) = scalar_shape(&pat_type.ty) {
+                // 标量类型（数字/布尔/字符串，可以套 Option / Vec）且不是路径参数 => 来自查询串（合并模式下是合并后的表单）
+                if shape == Shape::Many && matches!(inner, syn::Type::Reference(_)) {
+                    panic!("Vec<&str> 参数不支持，请改用 Vec<String>：参数 `{name}`（{}）", item_fn.sig.ident);
+                }
                 let wire = naming::for_param(&name, naming);
-                Some(ParamSource::Query(name, type_info(&pat_type.ty), wire))
+                Some(ParamSource::Query { name, ty: type_info(&inner), wire, shape })
+            } else if type_last_ident_is(&pat_type.ty, "MultipartFile") {
+                let wire = naming::for_param(&name, naming);
+                Some(ParamSource::File {
+                    name,
+                    kind: classify_field_kind(&pat_type.ty),
+                    rust_type: type_to_string(&pat_type.ty),
+                    wire,
+                })
             } else {
                 let struct_info = resolve_body_struct(file, file_mod_path, &pat_type.ty, naming);
                 Some(ParamSource::Body {
@@ -497,11 +634,40 @@ fn is_scalar_type(ty: &syn::Type) -> bool {
 
 /// `Ext<T>` → Some(false)，`Option<Ext<T>>` → Some(true)，其它 → None。
 fn ext_param_kind(ty: &syn::Type) -> Option<bool> {
-    if type_last_ident_is(ty, "Ext") {
+    wrapped_kind(ty, "Ext")
+}
+
+/// `Name` → Some(false)，`Option<Name>` → Some(true)，其它 → None（按类型路径最后一段判断）。
+fn wrapped_kind(ty: &syn::Type, name: &str) -> Option<bool> {
+    if type_last_ident_is(ty, name) {
         return Some(false);
     }
-    if type_last_ident_is(ty, "Option") && single_generic_arg(ty).is_some_and(|inner| type_last_ident_is(&inner, "Ext")) {
+    if type_last_ident_is(ty, "Option") && single_generic_arg(ty).is_some_and(|inner| type_last_ident_is(&inner, name)) {
         return Some(true);
+    }
+    None
+}
+
+/// `HeaderMap` → Some(false)，`&HeaderMap` → Some(true)。
+fn header_map_kind(ty: &syn::Type) -> Option<bool> {
+    match ty {
+        syn::Type::Reference(r) if type_last_ident_is(&r.elem, "HeaderMap") => Some(true),
+        other if type_last_ident_is(other, "HeaderMap") => Some(false),
+        _ => None,
+    }
+}
+
+/// `T` / `Option<T>` / `Vec<T>`（T 是标量）→ (形态, T)。
+fn scalar_shape(ty: &syn::Type) -> Option<(Shape, syn::Type)> {
+    if is_scalar_type(ty) {
+        return Some((Shape::One, ty.clone()));
+    }
+    for (wrapper, shape) in [("Option", Shape::Opt), ("Vec", Shape::Many)] {
+        if type_last_ident_is(ty, wrapper) {
+            if let Some(inner) = single_generic_arg(ty).filter(is_scalar_type) {
+                return Some((shape, inner));
+            }
+        }
     }
     None
 }
@@ -628,7 +794,10 @@ fn classify_field_kind(ty: &syn::Type) -> FieldKind {
         });
         return FieldKind::MultipartFile { inner_is_path };
     }
-    FieldKind::Plain(type_info(ty))
+    match scalar_shape(ty) {
+        Some((shape, inner)) => FieldKind::Plain(type_info(&inner), shape),
+        None => FieldKind::Plain(type_info(ty), Shape::One),
+    }
 }
 
 fn single_generic_arg(ty: &syn::Type) -> Option<syn::Type> {
@@ -713,7 +882,10 @@ fn extract_result_ok_err(ty: &syn::Type) -> Option<(syn::Type, syn::Type)> {
 pub fn generate_router_source(table: &RouteTable) -> String {
     let mut arms = String::new();
 
-    for route in &table.routes {
+    // 带 `{*name}` 的路由排在普通路由后面（优先级低于 `{name}`），固定段多的优先
+    let mut routes: Vec<&RouteInfo> = table.routes.iter().collect();
+    routes.sort_by_key(|r| r.rest_index().map_or(0, |index| usize::MAX - index));
+    for route in routes {
         write_route_arm(&mut arms, route);
     }
 
@@ -771,9 +943,18 @@ async fn __param_error(
     mut error: hyperoute_core::ParamError,
 ) -> hyper::Response<hyperoute_core::ResponseBody> {{
     error.route = route;
+    if error.kind == hyperoute_core::ParamErrorKind::Internal {{
+        // 服务端自己的问题（例如上传临时目录不可写）：和 __try_internal! 一样记日志，返回 500
+        eprintln!("[hyperoute] internal error on {{route}}: {{}}", error.reason.as_deref().unwrap_or("unknown"));
+        return hyperoute_core::internal_error_response();
+    }}
     // 原始错误（含 Rust 类型名、底层报错）只进服务端日志，不进默认响应
     eprintln!("[hyperoute] parameter error on {{route}}: {{error:?}}");
     let errors = hyperoute_core::ParamErrors::single(error);
+    // 请求体太大不是参数格式的问题：固定返回 413，不交给 #[PARAM_ERROR]
+    if errors.first().kind == hyperoute_core::ParamErrorKind::PayloadTooLarge {{
+        return hyperoute_core::error_response(&hyperoute_core::DefaultParamErrorResponse(errors));
+    }}
     {param_error_response}
 }}
 
@@ -806,7 +987,7 @@ fn __filter_chain(
     }})
 }}
 
-#[allow(unused_assignments, unused_mut, non_snake_case)]
+#[allow(unused_assignments, unused_mut, unused_variables, non_snake_case)]
 async fn __dispatch(
     mut req: hyperoute_core::Request,
 ) -> Result<hyperoute_core::Response, std::convert::Infallible> {{
@@ -845,6 +1026,8 @@ fn write_route_arm(out: &mut String, route: &RouteInfo) {
         .map(|s| match s {
             PathSegment::Literal(lit) => format!("{lit:?}"),
             PathSegment::Param(name) => name.clone(),
+            // 至少一段；值在下面用 `segments[index..]` 拼起来
+            PathSegment::Rest(_) => "_, ..".to_string(),
         })
         .collect::<Vec<_>>()
         .join(", ");
@@ -860,40 +1043,55 @@ fn write_route_arm(out: &mut String, route: &RouteInfo) {
         );
     }
 
-    // 查询串只需要解析一次；查询串和 extensions 都必须在任何 `req.into_body()`（Body 参数会消费 req）
-    // 之前取出，所以不管这两类参数在签名里排第几，都统一挪到最前面生成。
-    if route.params.iter().any(|p| matches!(p, ParamSource::Query(..))) {
-        let _ = writeln!(
-            setup,
-            "            let __query_map = hyperoute_core::query_map(req.uri().query());"
-        );
-    }
+    // 查询串、请求头、客户端地址、extensions 都必须在任何消费请求的操作（读取请求体）之前取出，
+    // 所以不管这些参数在签名里排第几，都统一挪到最前面生成。
     for param in &route.params {
-        if let ParamSource::QueryStruct { name, inner_type } = param {
-            let _ = writeln!(
-                setup,
-                "            let {name} = __try_param!({label:?}, hyperoute_core::query_struct(req.uri().query(), {inner_type:?}));"
-            );
-        }
-        if let ParamSource::Ext { name, optional } = param {
-            if *optional {
+        match param {
+            ParamSource::QueryStruct { name, inner_type } => {
                 let _ = writeln!(
                     setup,
-                    "            let {name} = hyperoute_core::take_ext_opt(req.extensions_mut());"
+                    "            let {name} = __try_param!({label:?}, hyperoute_core::query_struct(req.uri().query(), {inner_type:?}));"
                 );
-            } else {
+            }
+            ParamSource::Ext { name, optional: true } => {
+                let _ = writeln!(setup, "            let {name} = hyperoute_core::take_ext_opt(req.extensions_mut());");
+            }
+            ParamSource::Ext { name, optional: false } => {
                 // 缺数据说明过滤器没覆盖到这个路由，是服务端配置问题：记日志 + 500
                 let _ = writeln!(
                     setup,
                     "            let {name} = __try_internal!({label:?}, hyperoute_core::take_ext(req.extensions_mut()));"
                 );
             }
+            ParamSource::Headers { name, by_ref: false } => {
+                let _ = writeln!(setup, "            let {name} = req.headers().clone();");
+            }
+            ParamSource::Headers { name, by_ref: true } => {
+                let _ = writeln!(setup, "            let {name}__headers = req.headers().clone();");
+                let _ = writeln!(setup, "            let {name} = &{name}__headers;");
+            }
+            ParamSource::RemoteAddr { name, optional: true } => {
+                let _ = writeln!(setup, "            let {name} = hyperoute_core::RemoteAddr::from_request(&req);");
+            }
+            ParamSource::RemoteAddr { name, optional: false } => {
+                let _ = writeln!(
+                    setup,
+                    "            let {name} = __try_internal!({label:?}, hyperoute_core::RemoteAddr::require(&req));"
+                );
+            }
+            _ => {}
         }
     }
 
+    write_form_source(&mut setup, route);
+
     for param in &route.params {
         match param {
-            ParamSource::Ext { .. } | ParamSource::WebSocket { .. } | ParamSource::QueryStruct { .. } => {}
+            ParamSource::Ext { .. }
+            | ParamSource::WebSocket { .. }
+            | ParamSource::QueryStruct { .. }
+            | ParamSource::Headers { .. }
+            | ParamSource::RemoteAddr { .. } => {}
             ParamSource::Path(name, ty) => {
                 if ty.is_str_ref {
                     // match 模式里绑定的是 `&&str`，这里解一层引用即可，不需要转换
@@ -907,45 +1105,45 @@ fn write_route_arm(out: &mut String, route: &RouteInfo) {
                     );
                 }
             }
-            ParamSource::Query(name, ty, wire) if !wire.is_plain(name) => {
-                // ParamNaming::CamelCase：按编译期算好的候选名依次查找（原名优先）
-                let keys = wire.lookup_literal();
-                let display = &wire.display;
+            ParamSource::RestPath { name, ty, index } => {
+                let _ = writeln!(setup, "            let {name}__rest = segments[{index}..].join(\"/\");");
                 if ty.is_str_ref {
-                    let _ = writeln!(
-                        setup,
-                        "            let {name} = __try_param!({label:?}, hyperoute_core::query_param_str_any(&__query_map, {keys}, {display:?}));"
-                    );
+                    let _ = writeln!(setup, "            let {name}: &str = &{name}__rest;");
+                } else if ty.rust_type.ends_with("String") {
+                    let _ = writeln!(setup, "            let {name} = {name}__rest;");
                 } else {
                     let _ = writeln!(
                         setup,
-                        "            let {name} = __try_param!({label:?}, hyperoute_core::query_param_any(&__query_map, {keys}, {display:?}, {expected}, {rust_type:?}));",
+                        "            let {name} = __try_param!({label:?}, hyperoute_core::parse_param(hyperoute_core::ParamLocation::Path, {name:?}, &{name}__rest, {expected}, {rust_type:?}));",
                         expected = expected_literal(ty.expected),
                         rust_type = ty.rust_type,
                     );
                 }
             }
-            ParamSource::Query(name, ty, _) => {
-                if ty.is_str_ref {
-                    let _ = writeln!(
-                        setup,
-                        "            let {name} = __try_param!({label:?}, hyperoute_core::query_param_str(&__query_map, {name:?}));"
-                    );
-                } else {
-                    let _ = writeln!(
-                        setup,
-                        "            let {name} = __try_param!({label:?}, hyperoute_core::query_param(&__query_map, {name:?}, {expected}, {rust_type:?}));",
-                        expected = expected_literal(ty.expected),
-                        rust_type = ty.rust_type,
-                    );
-                }
+            ParamSource::Query { name, ty, wire, shape } => {
+                write_form_value(&mut setup, route, name, ty, wire, *shape, "            ");
             }
             ParamSource::Body {
                 name,
                 rust_type,
                 struct_info,
             } => {
-                write_body_setup(&mut setup, label, name, rust_type, struct_info.as_ref());
+                if route.merged {
+                    write_body_setup_merged(&mut setup, route, name, rust_type, struct_info.as_ref());
+                } else {
+                    write_body_setup(&mut setup, label, name, rust_type, struct_info.as_ref());
+                }
+            }
+            ParamSource::File { name, kind, rust_type, wire } => {
+                let take = multipart_take_expr(label, name, rust_type, wire);
+                let (mut pre, mut stmts) = (String::new(), String::new());
+                let value = file_value(label, name, kind, &take, &mut pre, &mut stmts, "            ");
+                setup.push_str(&pre);
+                setup.push_str(&stmts);
+                let _ = writeln!(setup, "            let {name} = {value};");
+            }
+            ParamSource::BodyStream { name } => {
+                let _ = writeln!(setup, "            let {name} = hyperoute_core::BodyStream::new(req.into_body());");
             }
         }
     }
@@ -989,7 +1187,7 @@ fn write_route_arm(out: &mut String, route: &RouteInfo) {
                 .map(hyperoute_core::boxed_full)"#
             .to_string(),
         ReturnKind::Raw => r#"{
-                let mut __builder = hyper::Response::builder().status(hyper::StatusCode::OK);
+                let mut __builder = hyper::Response::builder().status(__body.status);
                 for (__header_name, __header_value) in __body.headers.iter() {
                     __builder = __builder.header(*__header_name, __header_value);
                 }
@@ -1000,7 +1198,7 @@ fn write_route_arm(out: &mut String, route: &RouteInfo) {
             }"#
             .to_string(),
         ReturnKind::Stream => r#"{
-                let mut __builder = hyper::Response::builder().status(hyper::StatusCode::OK);
+                let mut __builder = hyper::Response::builder().status(__body.status);
                 for (__header_name, __header_value) in __body.headers.iter() {
                     __builder = __builder.header(*__header_name, __header_value);
                 }
@@ -1128,9 +1326,23 @@ fn write_body_setup(
         setup,
         "            let __content_type = req.headers().get(\"content-type\").and_then(|v| v.to_str().ok()).unwrap_or(\"\").to_string();"
     );
+    // multipart 边收边解析（大文件转存到临时文件）；其它 content-type 整体读取（受请求体大小上限限制）。
+    // 找不到 struct 定义时不支持 multipart，这种请求不读取请求体，直接在下面返回 unsupported。
+    let multipart_read = if struct_info.is_some() {
+        format!(
+            "if __content_type.starts_with(\"multipart/form-data\") {{ __fields = __try_param!({label:?}, hyperoute_core::read_multipart_fields(req.into_body(), &__content_type).await); }} else "
+        )
+    } else {
+        "if __content_type.starts_with(\"multipart/form-data\") {} else ".to_string()
+    };
+    let _ = writeln!(setup, "            let mut __body_bytes = hyper::body::Bytes::new();");
     let _ = writeln!(
         setup,
-        "            let __body_bytes = __try_param!({label:?}, http_body_util::BodyExt::collect(req.into_body()).await.map(|b| b.to_bytes()).map_err(hyperoute_core::body_read_error));"
+        "            let mut __fields: std::collections::HashMap<String, hyperoute_core::MultipartField> = std::collections::HashMap::new();"
+    );
+    let _ = writeln!(
+        setup,
+        "            {multipart_read}{{ __body_bytes = __try_param!({label:?}, hyperoute_core::read_body_limited(req.into_body()).await); }}"
     );
 
     let unsupported = format!(
@@ -1138,11 +1350,11 @@ fn write_body_setup(
     );
 
     let has_file_field = struct_info.is_some_and(|info| {
-        info.fields.iter().any(|(_, kind, _, _)| !matches!(kind, FieldKind::Plain(_)))
+        info.fields.iter().any(|(_, kind, _, _)| !matches!(kind, FieldKind::Plain(..)))
     });
 
     if has_file_field {
-        let (pre_decls, multipart_branch) = render_multipart_branch(label, struct_info.unwrap());
+        let (pre_decls, multipart_branch) = render_multipart_branch(label, struct_info.unwrap(), None);
         setup.push_str(&pre_decls);
         let _ = writeln!(
             setup,
@@ -1151,7 +1363,7 @@ fn write_body_setup(
     } else {
         let multipart_branch = match struct_info {
             Some(info) => {
-                let (pre_decls, branch) = render_multipart_branch(label, info);
+                let (pre_decls, branch) = render_multipart_branch(label, info, None);
                 setup.push_str(&pre_decls);
                 branch
             }
@@ -1172,72 +1384,36 @@ fn write_body_setup(
 /// 整个 `if/else` 表达式还长的变量里——如果直接在分支内部 `let tmp = write_temp_file(...).await;`，
 /// `tmp` 出了分支就被 drop 掉，构造出来的 `&Path` 就成悬空引用，编译器会直接拒绝。
 /// 所以每个文件路径字段都在外层先声明一个 `Option<PathBuf>` 占位，分支内部只是把值填进去、再借用。
-fn render_multipart_branch(label: &str, info: &BodyStructInfo) -> (String, String) {
+///
+/// multipart 已经在外面边收边解析到 `__fields` 里了。`merged` 是 Some 时（合并模式），文本字段从合并后的表单取值。
+fn render_multipart_branch(label: &str, info: &BodyStructInfo, merged: Option<&RouteInfo>) -> (String, String) {
     let mut pre_decls = String::new();
     let mut out = String::new();
-    let _ = writeln!(
-        out,
-        "                let mut __fields = __try_param!({label:?}, hyperoute_core::parse_multipart(__body_bytes, &__content_type).await);"
-    );
 
     let mut ctor_fields = Vec::new();
     for (field_name, kind, rust_type, wire) in &info.fields {
         ctor_fields.push(field_name.clone());
-        // 字段名就是 Rust 名字时沿用单名字版本；否则按编译期算好的候选名依次查找
-        let (take_fn, text_fn, keys) = if wire.is_plain(field_name) {
-            ("multipart_take", "multipart_text", format!("{field_name:?}"))
-        } else {
-            ("multipart_take_any", "multipart_text_any", format!("{}, {:?}", wire.lookup_literal(), wire.display))
-        };
-        let take = format!(
-            "__try_param!({label:?}, hyperoute_core::{take_fn}(&mut __fields, {keys}, {rust_type:?}))"
-        );
-        match kind {
-            FieldKind::Plain(ty) => {
+        match (kind, merged) {
+            (FieldKind::Plain(ty, shape), Some(route)) => {
+                write_form_value(&mut out, route, field_name, ty, wire, *shape, "                ");
+            }
+            (FieldKind::Plain(ty, _), None) => {
+                // 字段名就是 Rust 名字时沿用单名字版本；否则按编译期算好的候选名依次查找
+                let (text_fn, keys) = if wire.is_plain(field_name) {
+                    ("multipart_text", format!("{field_name:?}"))
+                } else {
+                    ("multipart_text_any", format!("{}, {:?}", wire.lookup_literal(), wire.display))
+                };
                 let _ = writeln!(
                     out,
                     "                let {field_name} = __try_param!({label:?}, hyperoute_core::{text_fn}(&mut __fields, {keys}, {expected}, {rust_type:?}));",
                     expected = expected_literal(ty.expected),
                 );
             }
-            FieldKind::RawBytes => {
-                let _ = writeln!(out, "                let {field_name} = {take}.data;");
-            }
-            FieldKind::TempPath => {
-                let _ = writeln!(
-                    pre_decls,
-                    "            let mut {field_name}__holder: Option<std::path::PathBuf> = None;"
-                );
-                let _ = writeln!(out, "                let {field_name}__raw = {take};");
-                let _ = writeln!(
-                    out,
-                    "                {field_name}__holder = Some(__try_internal!({label:?}, hyperoute_core::write_temp_file(&{field_name}__raw.data).await));"
-                );
-                let _ = writeln!(
-                    out,
-                    "                let {field_name} = {field_name}__holder.as_ref().unwrap().as_path();"
-                );
-            }
-            FieldKind::MultipartFile { inner_is_path: false } => {
-                let _ = writeln!(
-                    out,
-                    "                let {field_name} = {{ let __f = {take}; hyperoute_core::MultipartFile {{ name: __f.file_name.unwrap_or_default(), content_type: __f.content_type, body: __f.data }} }};"
-                );
-            }
-            FieldKind::MultipartFile { inner_is_path: true } => {
-                let _ = writeln!(
-                    pre_decls,
-                    "            let mut {field_name}__holder: Option<std::path::PathBuf> = None;"
-                );
-                let _ = writeln!(out, "                let {field_name}__raw = {take};");
-                let _ = writeln!(
-                    out,
-                    "                {field_name}__holder = Some(__try_internal!({label:?}, hyperoute_core::write_temp_file(&{field_name}__raw.data).await));"
-                );
-                let _ = writeln!(
-                    out,
-                    "                let {field_name} = hyperoute_core::MultipartFile {{ name: {field_name}__raw.file_name.unwrap_or_default(), content_type: {field_name}__raw.content_type, body: {field_name}__holder.as_ref().unwrap().as_path() }};"
-                );
+            (kind, _) => {
+                let take = multipart_take_expr(label, field_name, rust_type, wire);
+                let value = file_value(label, field_name, kind, &take, &mut pre_decls, &mut out, "                ");
+                let _ = writeln!(out, "                let {field_name} = {value};");
             }
         }
     }
@@ -1249,4 +1425,254 @@ fn render_multipart_branch(label: &str, info: &BodyStructInfo) -> (String, Strin
         ctor_fields = ctor_fields.join(", "),
     );
     (pre_decls, out)
+}
+
+/// 从 `__fields` 取出一个 multipart 字段的表达式（没传返回参数错误）。
+fn multipart_take_expr(label: &str, name: &str, rust_type: &str, wire: &naming::WireName) -> String {
+    let (take_fn, keys) = if wire.is_plain(name) {
+        ("multipart_take", format!("{name:?}"))
+    } else {
+        ("multipart_take_any", format!("{}, {:?}", wire.lookup_literal(), wire.display))
+    };
+    format!("__try_param!({label:?}, hyperoute_core::{take_fn}(&mut __fields, {keys}, {rust_type:?}))")
+}
+
+/// 文件字段 / 文件参数的值表达式。`&Path` 用的临时文件占位声明写进 `pre`（外层作用域，活到 handler 返回之后，
+/// 离开作用域时 `TempFile` 自动删除文件），取值语句写进 `out`。
+fn file_value(label: &str, name: &str, kind: &FieldKind, take: &str, pre: &mut String, out: &mut String, indent: &str) -> String {
+    match kind {
+        FieldKind::RawBytes => format!("__try_internal!({label:?}, {take}.into_bytes().await)"),
+        FieldKind::MultipartFile { inner_is_path: false } => format!(
+            "{{ let mut __f = {take}; let __name = __f.file_name.take().unwrap_or_default(); let __content_type = __f.content_type.take(); hyperoute_core::MultipartFile {{ name: __name, content_type: __content_type, body: __try_internal!({label:?}, __f.into_bytes().await) }} }}"
+        ),
+        FieldKind::TempPath | FieldKind::MultipartFile { inner_is_path: true } => {
+            let _ = writeln!(pre, "            let mut {name}__holder: Option<hyperoute_core::TempFile> = None;");
+            let _ = writeln!(out, "{indent}let mut {name}__raw = {take};");
+            let _ = writeln!(out, "{indent}let {name}__file_name = {name}__raw.file_name.take().unwrap_or_default();");
+            let _ = writeln!(out, "{indent}let {name}__content_type = {name}__raw.content_type.take();");
+            let _ = writeln!(
+                out,
+                "{indent}{name}__holder = Some(__try_internal!({label:?}, {name}__raw.into_temp_file().await));"
+            );
+            let path = format!("{name}__holder.as_ref().unwrap().as_path()");
+            if matches!(kind, FieldKind::TempPath) {
+                path
+            } else {
+                format!(
+                    "hyperoute_core::MultipartFile {{ name: {name}__file_name, content_type: {name}__content_type, body: {path} }}"
+                )
+            }
+        }
+        FieldKind::Plain(..) => unreachable!("文本字段不走文件取值"),
+    }
+}
+
+/// 准备标量参数 / 请求体用的数据源：
+/// - 默认模式：`__form` 只包含查询串；有文件参数时另外按 multipart 读取请求体（`__fields`）。
+/// - 合并模式：`FormRequest::read` 读一次请求体，得到合并后的 `__form`、`__content_type`、`__body_bytes`、`__fields`；
+///   WebSocket 路由和带 `BodyStream` 参数的路由不读请求体，`__form` 只包含查询串。
+fn write_form_source(setup: &mut String, route: &RouteInfo) {
+    let label = &route.label;
+    let has = |f: fn(&ParamSource) -> bool| route.params.iter().any(f);
+    let has_query = has(|p| matches!(p, ParamSource::Query { .. }));
+    let has_body = has(|p| matches!(p, ParamSource::Body { .. }));
+    let has_stream = has(|p| matches!(p, ParamSource::BodyStream { .. }));
+    let first_file = route.params.iter().find_map(|p| match p {
+        ParamSource::File { rust_type, .. } => Some(rust_type.as_str()),
+        _ => None,
+    });
+
+    if route.merged {
+        if route.websocket || has_stream {
+            if has_query {
+                let _ = writeln!(setup, "            let __form = hyperoute_core::FormData::merged_query(req.uri().query());");
+            }
+        } else if has_query || has_body || first_file.is_some() {
+            let _ = writeln!(
+                setup,
+                "            let hyperoute_core::FormRequest {{ form: __form, content_type: __content_type, body: __body_bytes, files: mut __fields }} = __try_param!({label:?}, hyperoute_core::FormRequest::read(req).await);"
+            );
+        }
+        return;
+    }
+
+    if has_query {
+        let _ = writeln!(setup, "            let __form = hyperoute_core::FormData::from_query(req.uri().query());");
+    }
+    if let Some(rust_type) = first_file {
+        let _ = writeln!(
+            setup,
+            "            let hyperoute_core::FormRequest {{ files: mut __fields, .. }} = __try_param!({label:?}, hyperoute_core::FormRequest::read_multipart(req, {rust_type:?}).await);"
+        );
+    }
+}
+
+/// 一个标量参数（或合并模式下 multipart 结构体的文本字段）的取值语句：`let name = ...;`。
+fn write_form_value(
+    out: &mut String,
+    route: &RouteInfo,
+    name: &str,
+    ty: &TypeInfo,
+    wire: &naming::WireName,
+    shape: Shape,
+    indent: &str,
+) {
+    let label = &route.label;
+    let keys = wire.lookup_literal();
+    let display = &wire.display;
+    let expected = expected_literal(ty.expected);
+    let rust_type = &ty.rust_type;
+    // 严格模式：失败时返回参数错误；宽松模式：失败时得到默认值 / None
+    let one = |call: String| {
+        if route.lenient { format!("hyperoute_core::lenient({label:?}, {call})") } else { format!("__try_param!({label:?}, {call})") }
+    };
+    let opt = |call: String| {
+        if route.lenient { format!("hyperoute_core::lenient_opt({label:?}, {call})") } else { format!("__try_param!({label:?}, {call})") }
+    };
+
+    match shape {
+        Shape::One if ty.is_str_ref && !route.merged => {
+            let value = one(format!("hyperoute_core::form_str(&__form, {keys}, {display:?})"));
+            let _ = writeln!(out, "{indent}let {name} = {value};");
+        }
+        Shape::One if ty.is_str_ref => {
+            // 合并模式下的值可能是 "[a,b]" 拆开后新生成的字符串，借用不了，先取成 String
+            let value = one(format!("hyperoute_core::form_value::<String>(&__form, {keys}, {display:?}, {expected}, \"&str\")"));
+            let _ = writeln!(out, "{indent}let {name}__owned: String = {value};");
+            let _ = writeln!(out, "{indent}let {name}: &str = &{name}__owned;");
+        }
+        Shape::One => {
+            let value = one(format!("hyperoute_core::form_value(&__form, {keys}, {display:?}, {expected}, {rust_type:?})"));
+            let _ = writeln!(out, "{indent}let {name} = {value};");
+        }
+        Shape::Opt if ty.is_str_ref && !route.merged => {
+            let _ = writeln!(out, "{indent}let {name} = __try_param!({label:?}, hyperoute_core::form_opt_str(&__form, {keys}));");
+        }
+        Shape::Opt if ty.is_str_ref => {
+            let value = opt(format!("hyperoute_core::form_opt::<String>(&__form, {keys}, {expected}, \"&str\")"));
+            let _ = writeln!(out, "{indent}let {name}__owned: Option<String> = {value};");
+            let _ = writeln!(out, "{indent}let {name} = {name}__owned.as_deref();");
+        }
+        Shape::Opt => {
+            let value = opt(format!("hyperoute_core::form_opt(&__form, {keys}, {expected}, {rust_type:?})"));
+            let _ = writeln!(out, "{indent}let {name} = {value};");
+        }
+        Shape::Many if route.lenient => {
+            let _ = writeln!(
+                out,
+                "{indent}let {name} = hyperoute_core::form_vec_lenient({label:?}, &__form, {keys}, {expected}, {rust_type:?});"
+            );
+        }
+        Shape::Many => {
+            let _ = writeln!(
+                out,
+                "{indent}let {name} = __try_param!({label:?}, hyperoute_core::form_vec(&__form, {keys}, {expected}, {rust_type:?}));"
+            );
+        }
+    }
+}
+
+/// 合并模式下的请求体结构体参数：
+/// - 含文件字段：只支持 multipart，文本字段从合并后的表单取值，文件字段从 `__fields` 取；
+/// - 不含文件字段：JSON 请求体按 JSON 解析，其它情况（urlencoded / multipart / 没有请求体的 GET）
+///   从合并后的表单按字段名取值（`form_struct`，需要 `Deserialize`）。
+fn write_body_setup_merged(
+    setup: &mut String,
+    route: &RouteInfo,
+    name: &str,
+    rust_type: &str,
+    struct_info: Option<&BodyStructInfo>,
+) {
+    let label = &route.label;
+    let has_file_field = struct_info.is_some_and(|info| {
+        info.fields.iter().any(|(_, kind, _, _)| !matches!(kind, FieldKind::Plain(..)))
+    });
+
+    if has_file_field {
+        let (pre_decls, multipart_branch) = render_multipart_branch(label, struct_info.unwrap(), Some(route));
+        setup.push_str(&pre_decls);
+        let _ = writeln!(
+            setup,
+            "            let {name} = if __content_type.starts_with(\"multipart/form-data\") {{\n{multipart_branch}            }} else {{\n                return Ok(__param_error({label:?}, hyperoute_core::unsupported_content_type(&__content_type, {rust_type:?})).await);\n            }};"
+        );
+        return;
+    }
+
+    let options = format!(
+        "hyperoute_core::FormOptions {{ lenient: {}, camel: {} }}",
+        route.lenient, route.camel
+    );
+    let _ = writeln!(
+        setup,
+        "            let {name} = if __content_type.starts_with(\"application/json\") {{\n                __try_param!({label:?}, hyperoute_core::json_body(&__body_bytes, {rust_type:?}))\n            }} else {{\n                __try_param!({label:?}, hyperoute_core::form_struct({label:?}, &__form, {rust_type:?}, {options}))\n            }};"
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn routes(src: &str, options: ScanOptions) -> Vec<RouteInfo> {
+        let file: syn::File = syn::parse_str(src).unwrap();
+        let dir = std::env::temp_dir().join(format!("hyperoute-codegen-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("t{}.rs", src.len()));
+        fs::write(&path, quote::quote!(#file).to_string()).unwrap();
+        let mut collected = Collected::default();
+        scan_file(&path, "crate::t", &mut collected, options);
+        let _ = fs::remove_file(&path);
+        collected.routes
+    }
+
+    #[test]
+    fn classifies_new_param_kinds() {
+        let r = routes(
+            r#"#[GET("/d/{id}/{*path}")]
+               async fn f(id: i64, path: String, headers: &HeaderMap, addr: Option<RemoteAddr>, ids: Vec<i64>, tag: Option<&str>, _client_flag: i32) -> String { todo!() }"#,
+            ScanOptions { naming: ParamNaming::CamelCase, ..Default::default() },
+        );
+        let p = &r[0].params;
+        assert!(matches!(&p[1], ParamSource::RestPath { index: 2, .. }));
+        assert!(matches!(&p[2], ParamSource::Headers { by_ref: true, .. }));
+        assert!(matches!(&p[3], ParamSource::RemoteAddr { optional: true, .. }));
+        assert!(matches!(&p[4], ParamSource::Query { shape: Shape::Many, .. }));
+        assert!(matches!(&p[5], ParamSource::Query { shape: Shape::Opt, ty, .. } if ty.is_str_ref));
+        let ParamSource::Query { wire, .. } = &p[6] else { panic!() };
+        assert_eq!(wire.lookup, ["_client_flag", "_clientFlag"]);
+        assert_eq!(r[0].rest_index(), Some(2));
+    }
+
+    #[test]
+    fn lenient_attribute_overrides_global() {
+        let src = r#"#[PARAM_STRICT] #[GET("/a")] async fn a(id: i64) -> String { todo!() }
+                     #[GET("/b")] async fn b(id: i64) -> String { todo!() }
+                     #[PARAM_LENIENT] #[GET("/c")] async fn c(id: i64) -> String { todo!() }"#;
+        let lenient = |o| routes(src, o).iter().map(|r| r.lenient).collect::<Vec<_>>();
+        assert_eq!(lenient(ScanOptions { fallback: ParamFallback::Default, ..Default::default() }), [false, true, true]);
+        assert_eq!(lenient(ScanOptions::default()), [false, false, true]);
+    }
+
+    #[test]
+    #[should_panic(expected = "只能写在路径模板的最后一段")]
+    fn rest_must_be_last() {
+        parse_path_template("/d/{*path}/x", "f");
+    }
+
+    #[test]
+    #[should_panic(expected = "BodyStream 参数不能和请求体结构体")]
+    fn body_stream_conflicts_with_body() {
+        routes(
+            r#"#[POST("/u")] async fn u(body: BodyStream, form: Form) -> String { todo!() }"#,
+            ScanOptions::default(),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "默认模式下 multipart 文件参数不能和请求体结构体参数同时使用")]
+    fn file_param_conflicts_with_body_in_separate_mode() {
+        let src = r#"#[POST("/u")] async fn u(file: MultipartFile<Vec<u8>>, form: Form) -> String { todo!() }"#;
+        // 合并模式下可以同时使用
+        routes(src, ScanOptions { binding: ParamBinding::Merged, ..Default::default() });
+        routes(src, ScanOptions::default());
+    }
 }

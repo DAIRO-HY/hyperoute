@@ -336,7 +336,7 @@ mod tests {
         let e = query_param_any::<u32>(&query, &["sort_by", "sortBy"], "sortBy", Some("integer"), "u32").unwrap_err();
         assert_eq!(e.to_string(), r#"Query parameter "sortBy" must be an integer, got "x"."#);
 
-        let field = |v: &str| MultipartField { file_name: None, content_type: None, data: v.as_bytes().to_vec() };
+        let field = |v: &str| MultipartField { file_name: None, content_type: None, data: v.as_bytes().to_vec(), spooled: None };
         let mut fields: HashMap<String, MultipartField> = [("userId".to_string(), field("7"))].into();
         assert_eq!(multipart_text_any::<i64>(&mut fields, &["user_id", "userId"], "userId", None, "i64").unwrap(), 7);
         let e = multipart_take_any(&mut fields, &["avatar_file", "avatarFile"], "avatarFile", "Vec<u8>").err().unwrap();

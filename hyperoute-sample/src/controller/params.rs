@@ -4,7 +4,7 @@
 use std::path::Path;
 
 use hyperoute_core::{MultipartFile, Query};
-use hyperoute_macro::{GET, POST};
+use hyperoute_macro::{GET, PARAM_LENIENT, POST};
 use serde::{Deserialize, Serialize};
 
 /// 参数名和路径里的 `{id}` 同名 → 取路径段。
@@ -19,6 +19,22 @@ pub async fn path_param(id: i64) -> String {
 #[GET("/params/query")]
 pub async fn query_params(id: i64, name: String) -> String {
     format!("id = {id}, name = {name}")
+}
+
+/// `Vec<T>` 取同名 key 的全部值，`Option<T>` 没传是 `None`。
+/// curl "http://127.0.0.1:3000/params/list?ids=1&ids=2&tag=x"
+#[GET("/params/list")]
+pub async fn list(ids: Vec<i64>, tag: Option<String>) -> String {
+    format!("ids = {ids:?}, tag = {tag:?}")
+}
+
+/// `#[PARAM_LENIENT]`：这个接口的参数缺失或转换失败时用默认值（`Option` 是 `None`），不返回 400。
+/// 全局默认是严格模式，也可以在 build.rs 里用 `.param_fallback(ParamFallback::Default)` 整体切换。
+/// curl "http://127.0.0.1:3000/params/lenient?page=x"   → page = 0, size = None
+#[PARAM_LENIENT]
+#[GET("/params/lenient")]
+pub async fn lenient(page: u32, size: Option<u32>) -> String {
+    format!("page = {page}, size = {size:?}")
 }
 
 /// build.rs 里开启了 `ParamNaming::CamelCase`：snake_case 参数名同时接受前端的驼峰写法（原名优先），

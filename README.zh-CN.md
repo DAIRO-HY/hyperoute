@@ -22,8 +22,9 @@ pub async fn get_user(id: i64, verbose: bool) -> Result<User, ApiError> {
 ## 功能
 
 - **路由注解**：`#[GET]`、`#[POST]`、`#[PUT]`、`#[DELETE]`、`#[PATCH]`、`#[HEAD]`、`#[OPTIONS]`、`#[CONNECT]`、`#[TRACE]`，以及匹配任意方法的 `#[REQUEST]`。
-- **按函数签名提取参数**：路径段、查询串、JSON / urlencoded / multipart 请求体、文件上传。
-- **按返回类型构建响应**：纯文本、JSON、带自定义响应头的二进制、流式响应、`Result<T, E>`。
+- **按函数签名提取参数**：路径段（含尾部通配 `{*path}`）、查询串、`Option` / `Vec` 参数、JSON / urlencoded / multipart 请求体、文件上传、请求头、客户端地址、不缓冲的流式请求体。
+- **Go / Spring 风格的表单绑定**（可选）：像 Go 的 `request.Form` 一样合并查询串和表单请求体取值；还可以开启宽松模式，参数缺失或格式不对时取默认值。
+- **按返回类型构建响应**：纯文本、JSON、带自定义响应头的二进制、流式响应、`Result<T, E>`。`Stream::file` 返回文件，支持 `Range`（断点下载、视频拖动）、`If-Range`、ETag/304 和 `Content-Disposition`。
 - **参数错误不会 panic**：参数格式不对时返回 `400`，并说明是哪个参数、为什么失败。
   - 响应格式可以自定义。
   - 默认文案不会暴露服务端的技术栈。
@@ -49,8 +50,8 @@ pub async fn get_user(id: i64, verbose: bool) -> Result<User, ApiError> {
 
 ```toml
 [dependencies]
-hyperoute-core = "0.0.5"
-hyperoute-macro = "0.0.5"
+hyperoute-core = "0.0.6"
+hyperoute-macro = "0.0.6"
 # 生成的路由代码会直接用到下面这几个 crate：
 hyper = { version = "1", features = ["full"] }
 http-body-util = "0.1"
@@ -60,7 +61,7 @@ tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 
 [build-dependencies]
-hyperoute-codegen = "0.0.5"
+hyperoute-codegen = "0.0.6"
 ```
 
 **2. `build.rs`**：扫描 handler 所在目录，把生成的路由代码写到 `OUT_DIR`
@@ -136,6 +137,9 @@ Hello, world!
 ## 路由
 
 - 路径模板按 `/` 分段：写成 `{name}` 的段是路径参数，其余段必须字面相等。
+- 最后一段可以写成尾部通配 `{*name}`：匹配剩下的 1 个或多个路径段，每段解码后用 `/` 拼起来。
+  - 带通配的路由优先级低于不带通配的路由。
+  - 例如 `/d/1/info` 走 `#[GET("/d/{id}/info")]`，`/d/1/info/x` 走 `#[GET("/d/{id}/{*path}")]`。
 - 路径末尾的 `/` 会被忽略。
 - 每个路径段在入口处统一 percent 解码一次，过滤器匹配、路由匹配和静态资源查找都使用这同一个解码后的路径。例如 `/hello/%E4%B8%AD` 的路径参数拿到的是 `中`。包含 `..`、编码后的 `/` 或 `\` 的路径直接返回 `400`。
 - `#[REQUEST("/path")]` 匹配任意 HTTP 方法。
@@ -148,7 +152,13 @@ Hello, world!
 | 参数 | 来源 | 示例 |
 |---|---|---|
 | 参数名和路径里的 `{name}` 相同 | 路径段，用 `FromStr` 转换 | `#[GET("/users/{id}")] fn f(id: i64)` |
-| 标量类型：整数、浮点数、`bool`、`char`、`String`、`&str` | 查询串 `?name=value` | `fn f(page: u32, keyword: String)` |
+| 标量类型：整数、浮点数、`bool`、`char`、`String`、`&str` | 查询串 `?name=value`（合并模式下是合并后的表单，见[表单绑定](#表单绑定go--spring-风格)） | `fn f(page: u32, keyword: String)` |
+| `Option<标量>` / `Vec<标量>` | 同上。没传时是 `None` / 空 `Vec`；`Vec` 取同名 key 的全部值（`?id=1&id=2`） | `fn f(tag: Option<String>, ids: Vec<i64>)` |
+| 路径里的 `{*name}` | 剩下的路径段，用 `/` 拼起来 | `#[GET("/files/{*path}")] fn f(path: String)` |
+| `HeaderMap` / `&HeaderMap` | 请求头（`hyper::HeaderMap`） | `fn f(headers: &HeaderMap)` |
+| `RemoteAddr` / `Option<RemoteAddr>` | 客户端地址，见[启动服务](#启动服务) | `fn f(addr: RemoteAddr)` |
+| `BodyStream` | 不缓冲的请求体 | `fn f(body: BodyStream)` |
+| `MultipartFile<Vec<u8>>` / `MultipartFile<&Path>` | multipart 请求体里和参数同名的文件字段 | `fn f(folder: String, file: MultipartFile<&Path>)` |
 | `Query<T>` | 整个查询串，解析到结构体 `T`，不区分请求方法 | `fn f(q: Query<Search>)` |
 | `Ext<T>` / `Option<Ext<T>>` | [过滤器](#过滤器)放进请求的数据 | `fn f(user: Ext<CurrentUser>)` |
 | `WebSocket` | 只能用在 [`#[WEBSOCKET]`](#websocket) 路由 | `fn f(socket: WebSocket)` |
@@ -174,7 +184,7 @@ pub async fn find(id: i64, info: Query<UserInfo>) -> String {
 pub async fn create(info: Query<UserInfo>, form: UserForm) -> String { /* ... */ }
 ```
 
-解析失败时按查询参数报错，例如 `Query parameter "age" is invalid, got "x".`。同名参数出现多次（`?tag=a&tag=b`）暂时还不能绑定到 `Vec`。
+解析失败时按查询参数报错，例如 `Query parameter "age" is invalid, got "x".`。`Query<T>` 里同名参数出现多次（`?tag=a&tag=b`）还不能绑定到 `Vec` 字段，请改用 `Vec<String>` 类型的 handler 参数。
 
 **参数命名（前端用驼峰）。** 前端通常用驼峰命名（`pageSize`），Rust 用下划线命名（`page_size`）。各类参数的处理方式如下：
 
@@ -196,6 +206,7 @@ hyperoute_codegen::Scanner::new()
 - **两种写法都能接收**：`fn list(page_size: u32, sort_by: String)` 既能接收 `?pageSize=20&sortBy=name`，也能接收 `?page_size=20&sort_by=name`。两种写法同时出现时，以 Rust 原名为准。
 - **驼峰名在编译期就算好**，运行时不做任何字符串转换。没有下划线的参数名（`id`、`name`）生成的代码和以前完全一样。
 - **错误信息里显示驼峰名**，例如 `Query parameter "pageSize" is required.`。
+- **前导下划线会保留**：`_client_flag` 也接受 `_clientFlag`。这一点和 serde 的 `rename_all = "camelCase"` 不同，serde 会去掉前导下划线。
 
 想让整套接口都用驼峰：请求和响应的结构体都加上 `#[serde(rename_all = "camelCase")]`，标量参数再打开 `ParamNaming::CamelCase`。
 
@@ -206,7 +217,7 @@ hyperoute_codegen::Scanner::new()
 | `application/json` | `serde_json`（类型需要实现 `Deserialize`） |
 | `application/x-www-form-urlencoded`，或没有 content-type | `serde_urlencoded` |
 | `multipart/form-data` | 逐个字段解析，见下文 |
-| 其它 | 返回 `400`，提示不支持的 content-type |
+| 其它 | 返回 `400`，提示不支持的 content-type（开启 `ParamBinding::Merged` 时改为从查询串绑定结构体） |
 
 **multipart 和文件上传。** 要支持 multipart，请求体结构体必须和 handler 定义在**同一个文件**里，代码生成时才能看到它的字段。嵌套在 `mod {}` 里也可以。每个字段按类型取值：
 
@@ -217,7 +228,16 @@ hyperoute_codegen::Scanner::new()
 | `&Path` | 文件内容写到临时文件，拿到临时文件路径 |
 | `MultipartFile<Vec<u8>>` / `MultipartFile<&Path>` | 同上，额外带 `name`（文件名）和 `content_type` |
 
-结构体里只要有文件字段，就只接受 `multipart/form-data`，也不需要实现 `Deserialize`。临时文件**不会**自动删除。
+结构体里只要有文件字段，就只接受 `multipart/form-data`，也不需要实现 `Deserialize`。
+
+**上传是边收边解析的。**
+- 文件字段先放在内存里，超过 [multipart 内存阈值](#请求体限制)（默认 1MB）后转存到临时文件，剩下的数据边收边写进去。所以几 GB 的上传也只占用几 MB 内存。
+- 字段顺序不影响绑定：排在文件后面的文本字段照样能正常绑定。
+
+**临时文件会自动删除。**
+- 请求处理完就删除，包括 handler 返回之后，以及参数解析失败时。
+- 要保留上传的文件，请在 handler 里用 `tokio::fs::rename(path, 目标路径)` 移走，或者复制一份。
+- `hyperoute_core::write_temp_file` 返回的文件仍然不会被删除。
 
 ```rust
 #[POST("/upload")]
@@ -230,6 +250,113 @@ pub struct UploadForm<'a> {
 }
 ```
 
+### 请求体限制
+
+下面几项配置由框架自己从环境变量读取，项目里不用写代码：
+
+| 环境变量 | 作用 | 默认值 |
+|---|---|---|
+| `HYPEROUTE_MULTIPART_MEMORY_LIMIT` | multipart 文件超过这个大小就转存到临时文件；文本字段超过这个大小返回 `413` | 1MB |
+| `HYPEROUTE_MAX_BODY_SIZE` | 请求体大小上限，超过返回 `413` | 不限制 |
+| `HYPEROUTE_UPLOAD_TEMP_DIR` | 上传临时文件的目录，不存在时自动创建；无法创建或写入时返回 `500`，原因记到日志里 | 系统临时目录 |
+
+- **临时文件放在哪里**：建议把 `HYPEROUTE_UPLOAD_TEMP_DIR` 设在和存储目录同一个文件系统上，handler 里就能直接 `rename`，不用复制。Docker 挂载卷，以及 `/tmp` 是 tmpfs（占用内存）的系统，尤其要注意这一点。
+- **大小的写法**：`65536`、`512KB`、`64MB`、`10GB`（按 1024 换算）。格式不对时会忽略，并在 stderr 打一条警告。
+- **读取时机**：环境变量在第一次用到时读取一次，修改后需要重启进程。
+- **大小上限的范围**：只限制框架替 handler 读取的请求体，包括 JSON、urlencoded、multipart 和合并表单。有 `Content-Length` 时先比较，没有时边读边计数。
+- **`BodyStream` 不受限制**，由 handler 自己判断，例如用 `size_hint()`。
+- **`413` 不经过 `#[PARAM_ERROR]`**：固定返回纯文本 `Request body is too large.`。
+
+没法设置环境变量的环境（例如内嵌在 iOS App 里），可以用代码设置同样的值。代码设置的值优先级高于环境变量，之后进来的请求按新值处理：
+
+```rust
+hyperoute_core::set_multipart_memory_limit(64 * 1024 * 1024);
+hyperoute_core::set_max_body_size(Some(10 * 1024 * 1024 * 1024));
+hyperoute_core::set_upload_temp_dir("/app/data/temp");
+```
+
+**流式请求体。** `BodyStream` 参数拿到的是不缓冲的请求体，适合大到无法放进内存的上传：
+
+```rust
+#[POST("/upload/{name}")]
+pub async fn upload(name: String, mut body: BodyStream) -> Result<String, ApiError> {
+    let mut file = tokio::fs::File::create(format!("/data/{name}")).await?;
+    while let Some(chunk) = body.next_chunk().await {
+        file.write_all(&chunk?).await?;
+    }
+    Ok("ok".into())
+}
+```
+
+- `BodyStream` 也实现了 `futures::Stream`。
+- 有 `Content-Length` 时，`size_hint()` 返回它。
+- 一个 handler 最多一个 `BodyStream`，而且不能和请求体结构体或文件参数同时使用，否则编译失败。
+- 如果过滤器调用过 `read_body`，handler 拿到的是过滤器放回去的那份数据。
+
+### 表单绑定（Go / Spring 风格）
+
+默认情况下，标量参数只从查询串取值，结构体参数从请求体解析。从 Go 的 `net/http`（`request.Form`）或 Spring 迁移过来的项目，可以在 `build.rs` 里改成合并取值：
+
+```rust
+use hyperoute_codegen::{ParamBinding, ParamFallback};
+
+hyperoute_codegen::Scanner::new()
+    .dir(src.join("controller"), "crate::controller")
+    .param_binding(ParamBinding::Merged)     // 默认：ParamBinding::Separate
+    .param_fallback(ParamFallback::Default)  // 可选，默认：ParamFallback::Strict
+    .scan();
+```
+
+开启 `ParamBinding::Merged` 后，查询串和表单请求体合并取值，顺序和 Go 一致：
+
+| 请求体 | 取值顺序 |
+|---|---|
+| `application/x-www-form-urlencoded`（或没有 content-type） | 请求体的值在前，查询串的值在后 |
+| `multipart/form-data` | 查询串的值在前，文本字段在后 |
+| 其它（JSON 等） | 只取查询串 |
+
+- **标量取第一个值，`Vec` 取全部值。**
+  - 和 Go 版 AutoWeb 一样，只有一个值且写成 `"[a,b,c]"` 时也会拆成列表：去掉首尾的 `[]`，按 `,` 拆开，每项里的 `_2c` 还原成 `,`。
+  - 标量取拆开后的第一项，所以 `?id=[5]` 得到 `5`。
+  - `"[]"` 和 Go 一样得到一个空字符串。
+- **结构体参数从合并后的表单按字段名取值**，所以 GET 请求的查询串也能绑定到结构体。
+  - 支持 `Option` 和 `Vec` 字段、单元变体的枚举，以及 serde 属性（`rename`、`rename_all`、`alias`、`default`）。
+  - JSON 请求体仍然按 JSON 解析。
+  - 开启 `ParamNaming::CamelCase` 时，字段也接受驼峰名。
+- **请求体只读一次**，所以标量参数和文件参数可以写在同一个 handler 里：
+
+```rust
+#[POST("/upload")]
+pub async fn upload(folder: String, content_type: String, file: MultipartFile<&Path>) -> String { /* ... */ }
+```
+
+- 带 `BodyStream` 参数的路由和 WebSocket 路由不读请求体，参数只从查询串取值。
+- 合并模式下参数没传时，错误信息是 `Parameter "id" is required.`（location 是 `form`）。
+
+**宽松模式**（`ParamFallback::Default`）。标量参数没传或格式不对时，取 `Default::default()`，不返回 `400`。
+- `Option` 得到 `None`。
+- `Vec` 里格式不对的项取默认值。
+- 这和 Go 忽略类型转换错误的行为一致。不开启合并取值也能单独使用。
+
+可以用标记属性按 handler 覆盖全局设置：
+
+```rust
+use hyperoute_macro::{GET, PARAM_LENIENT, PARAM_STRICT};
+
+#[PARAM_STRICT]   // 不管全局怎么设置，参数不对一律返回 400
+#[GET("/api/v2/items")]
+pub async fn items(page: u32) -> String { /* ... */ }
+
+#[PARAM_LENIENT]  // 全局是严格模式时，这个接口也取默认值
+#[GET("/legacy/list")]
+pub async fn legacy(page: u32, size: Option<u32>) -> String { /* ... */ }
+```
+
+- **结构体字段**：缺失的字段和格式不对的值都取默认值，但 serde 的 `#[serde(default = ...)]` 优先。
+  - 枚举字段没有通用的默认值，缺失或取值不认识时仍然报错。要让它可以不传，请加上 `#[serde(default)]`。
+- **仍然严格校验的**：路径参数、文件字段、JSON 请求体、`Query<T>`。
+- **调试日志**：debug 构建下，每次取默认值都会往 stderr 打一条日志，方便找出传错参数的客户端。
+
 ## 响应
 
 返回类型决定响应的构建方式：
@@ -237,8 +364,8 @@ pub struct UploadForm<'a> {
 | 返回类型 | 响应 |
 |---|---|
 | `&str`、`String` | `200`，内容原样返回 |
-| `hyperoute_core::Raw` | `200`，二进制内容加自己设置的响应头 |
-| `hyperoute_core::Stream` | `200`，流式响应加自己设置的响应头 |
+| `hyperoute_core::Raw` | 二进制内容加自己设置的响应头；状态码默认 `200`，可以用 `.status(...)` 修改 |
+| `hyperoute_core::Stream` | 流式响应加自己设置的响应头；状态码默认 `200`，可以用 `.status(...)` 修改 |
 | 其它类型 | `200`，用 `serde_json` 序列化成 `application/json` |
 | `Result<T, E>` | `Ok(T)` 按上面的规则处理；`Err(E)` 通过 `IntoErrorResponse` 转换 |
 
@@ -254,6 +381,28 @@ pub async fn big_file() -> Stream {
     Stream::new(tokio_util::io::ReaderStream::new(file)).header("content-type", "application/octet-stream")
 }
 ```
+
+**支持 Range 的文件响应。** `Stream::file(path, &headers)` 返回一个文件，并按请求头处理：
+- **Range**：支持单段（`bytes=a-b`、`a-`、`-n`），返回 `206` 并带 `Content-Range`。
+- **不合法的范围**：无法满足的范围返回 `416`。多段或不认识的写法会忽略 Range 头，返回整个文件（`200`）。
+- **If-Range**：和当前的 ETag 或 Last-Modified 不一致时忽略 Range。
+- **条件请求**：`If-None-Match` 或 `If-Modified-Since` 命中时返回 `304`。
+- **响应头**：总是带 `Accept-Ranges: bytes`、`Content-Length`、按大小和修改时间生成的 `ETag`，以及 `Last-Modified`。
+
+```rust
+#[GET("/files/{*path}")]
+pub async fn download(path: String, headers: &HeaderMap) -> Result<Stream, ApiError> {
+    let stream = Stream::file(Path::new("/data").join(&path), headers).await
+        .map_err(|_| ApiError::not_found())?;          // io::Error：文件不存在、不是普通文件等
+    Ok(stream.attachment("报告.pdf"))                   // 也可以用 .inline(name)、.content_type("video/mp4")
+}
+```
+
+- **链式方法**：
+  - `.attachment(name)` / `.inline(name)` 设置 `Content-Disposition`，非 ASCII 文件名会按 RFC 5987 编码成 `filename*`。
+  - `.content_type(..)` 替换按扩展名猜出的类型。
+  - `.set_header(..)` 替换同名响应头，`.header(..)` 则是追加。
+- **静态资源目录不支持 Range**：下载和视频请用 handler 加 `Stream::file`。
 
 **错误类型**需要实现 `IntoErrorResponse`。后面的示例都用这个 JSON 错误类型：
 
@@ -312,9 +461,10 @@ pub fn on_param_error(errors: ParamErrors) -> ApiError {
     let e = errors.first(); // 目前总是恰好一个错误
     ApiError::new(StatusCode::BAD_REQUEST, json!({
         "code": "INVALID_PARAM",
-        "location": e.location.as_str(), // path | query | body | multipart | header
+        "location": e.location.as_str(), // path | query | body | multipart | header | form
         "param": e.param,                // 例如 "id"、"items[2].age"；针对整个请求体时为 None
         "kind": e.kind.as_str(),         // missing | invalid | out_of_range | unsupported_content_type | malformed_body
+                                         // （payload_too_large 不会进到这里，固定返回 413）
         "message": e.to_string(),        // 中性的默认文案
     }))
 }
@@ -504,10 +654,15 @@ hyperoute_core::serve("0.0.0.0:3000", routes::router).await?;
 ```rust
 let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
 loop {
-    let (stream, _) = listener.accept().await?;
-    tokio::spawn(hyperoute_core::serve_connection(stream, routes::router));
+    let (stream, peer) = listener.accept().await?;
+    tokio::spawn(hyperoute_core::serve_connection_with_addr(stream, peer, routes::router));
 }
 ```
+
+**客户端地址**：
+- 用 `serve_connection_with_addr(stream, peer, routes::router)` 传入对端地址后，handler 用 `RemoteAddr` 参数取出，过滤器用 `RemoteAddr::from_request(&req)` 取出。`serve` 总会提供地址。
+- 如果用不带地址的 `serve_connection`，`RemoteAddr` 参数会返回 `500` 并记日志，`Option<RemoteAddr>` 则得到 `None`。
+- 经过反向代理时拿到的是代理的地址。真实的客户端地址请从请求头的 `X-Forwarded-For` 里取。
 
 两者都使用 HTTP/1.1，并开启了协议升级。如果你直接用 hyper 驱动 `routes::router`，记得在连接上调用 `.with_upgrades()`，否则 WebSocket 无法升级。
 
@@ -524,7 +679,9 @@ $ curl -H 'Authorization: Bearer demo-token' http://127.0.0.1:3000/api/profile
 | 文件 | 演示内容 |
 |---|---|
 | `controller/hello.rs` | 基础路由、`#[REQUEST]` |
-| `controller/params.rs` | 路径参数、查询参数、JSON / urlencoded / multipart 请求体、文件上传 |
+| `controller/params.rs` | 路径参数、查询参数、`Option` / `Vec`、`#[PARAM_LENIENT]`、JSON / urlencoded / multipart 请求体、文件上传 |
+| `controller/files.rs` | `{*path}` 尾部通配、支持 Range 的 `Stream::file`、`&HeaderMap`、`RemoteAddr`、`BodyStream` 上传 |
+| `compat/dfs.rs` | 兼容 Go 的绑定方式：`ParamBinding::Merged` + `ParamFallback::Default`、`"[a,b]"` 列表、标量和文件写在同一个 handler、`#[PARAM_STRICT]`。`build.rs` 用第二个 `Scanner` 扫描 `src/compat`，`server.rs` 把 `/compat/*` 分给它 |
 | `controller/responses.rs` | 文本、JSON、`Result`、`Raw`、`Stream` |
 | `controller/param_error.rs` | 自定义参数错误格式（`#[PARAM_ERROR]`） |
 | `controller/user.rs` | 用 `Ext<T>` / `Option<Ext<T>>` 接收过滤器传来的数据 |
@@ -532,7 +689,8 @@ $ curl -H 'Authorization: Bearer demo-token' http://127.0.0.1:3000/api/profile
 | `filter/auth.rs` | Bearer token 鉴权过滤器：before 阶段、中断请求、传递数据 |
 | `filter/access_log.rs` | 计时过滤器：after 阶段 |
 | `error.rs` | 统一的 JSON 错误类型 |
-| `server.rs` | `serve`，以及用 `serve_connection` 自己写 accept 循环 |
+| `server.rs` | `serve`，以及用 `serve_connection_with_addr` 自己写 accept 循环 |
+| `tests.rs` | 走真实 TCP 的端到端测试（`cargo test -p hyperoute-sample`） |
 | `static/` + `build.rs` | 挂在 `/static` 的静态资源：子目录、gzip、ETag/304、HTML 模板合并（`static/include/header.tpl.html`），`static/private/` 受 auth 过滤器保护 |
 
 每个 handler 的文档注释里都附了对应的 `curl` 命令。

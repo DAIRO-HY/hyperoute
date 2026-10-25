@@ -19,8 +19,9 @@ pub async fn get_user(id: i64, verbose: bool) -> Result<User, ApiError> {
 ## Features
 
 - **Route attributes**: `#[GET]`, `#[POST]`, `#[PUT]`, `#[DELETE]`, `#[PATCH]`, `#[HEAD]`, `#[OPTIONS]`, `#[CONNECT]`, `#[TRACE]`, and `#[REQUEST]` (any method).
-- **Parameter extraction by signature**: path segments, query string, JSON / urlencoded / multipart bodies, and file uploads.
-- **Responses by return type**: plain text, JSON, raw bytes with custom headers, streaming bodies, and `Result<T, E>`.
+- **Parameter extraction by signature**: path segments (including a trailing `{*path}` wildcard), query string, `Option` / `Vec` parameters, JSON / urlencoded / multipart bodies, file uploads, request headers, the client address, and unbuffered streaming bodies.
+- **Go / Spring style form binding** (optional): merge the query string and form body like Go's `request.Form`, with an optional lenient mode where missing or malformed parameters become default values.
+- **Responses by return type**: plain text, JSON, raw bytes with custom headers, streaming bodies, and `Result<T, E>`. `Stream::file` serves files with `Range` (resumable downloads, video seeking), `If-Range`, ETag/304 and `Content-Disposition`.
 - **Parameter errors that never panic**: a malformed parameter returns `400` with a message saying which parameter failed and why. The response format is yours to define. Default messages don't reveal the server's tech stack.
 - **Filters** (`#[FILTER]`): "around"-style middleware with ordering, include/exclude path patterns, short-circuiting, and passing data such as the logged-in user to handlers (`Ext<T>`).
 - **WebSocket** (`#[WEBSOCKET]`): the handshake is handled for you. Handlers get path, query and filter data just like HTTP routes.
@@ -42,8 +43,8 @@ pub async fn get_user(id: i64, verbose: bool) -> Result<User, ApiError> {
 
 ```toml
 [dependencies]
-hyperoute-core = "0.0.5"
-hyperoute-macro = "0.0.5"
+hyperoute-core = "0.0.6"
+hyperoute-macro = "0.0.6"
 # The generated router uses these crates directly:
 hyper = { version = "1", features = ["full"] }
 http-body-util = "0.1"
@@ -53,7 +54,7 @@ tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 
 [build-dependencies]
-hyperoute-codegen = "0.0.5"
+hyperoute-codegen = "0.0.6"
 ```
 
 **2. `build.rs`**: scan your handler directories and write the router into `OUT_DIR`
@@ -128,7 +129,7 @@ Hello, world!
 
 ## Routing
 
-The path template is split on `/`. A segment written as `{name}` is a path parameter, and every other segment must match literally. Trailing slashes are ignored. Each path segment is percent-decoded once at the entry point, and the same decoded path is used for filter matching, routing and static files. For example, a path parameter in `/hello/%E4%B8%AD` receives `中`. Paths containing `..` or an encoded `/` or `\` are rejected with `400`. `#[REQUEST("/path")]` matches any HTTP method. Requests that match no route get `404 Not Found`.
+The path template is split on `/`. A segment written as `{name}` is a path parameter, and every other segment must match literally. The last segment may be a wildcard `{*name}`, which matches the remaining one or more segments and joins them with `/` (each segment decoded). Routes with a wildcard have lower priority than routes without one, so `#[GET("/d/{id}/info")]` wins over `#[GET("/d/{id}/{*path}")]` for `/d/1/info`, and `/d/1/info/x` goes to the wildcard route. Trailing slashes are ignored. Each path segment is percent-decoded once at the entry point, and the same decoded path is used for filter matching, routing and static files. For example, a path parameter in `/hello/%E4%B8%AD` receives `中`. Paths containing `..` or an encoded `/` or `\` are rejected with `400`. `#[REQUEST("/path")]` matches any HTTP method. Requests that match no route get `404 Not Found`.
 
 ## Request parameters
 
@@ -137,7 +138,13 @@ Each handler parameter's source is decided from its name and type:
 | Parameter | Source | Example |
 |---|---|---|
 | Name matches a `{name}` in the path | Path segment, converted with `FromStr` | `#[GET("/users/{id}")] fn f(id: i64)` |
-| Scalar type: integers, floats, `bool`, `char`, `String`, `&str` | Query string `?name=value` | `fn f(page: u32, keyword: String)` |
+| Scalar type: integers, floats, `bool`, `char`, `String`, `&str` | Query string `?name=value` (merged form, see [form binding](#form-binding-go--spring-style)) | `fn f(page: u32, keyword: String)` |
+| `Option<scalar>` / `Vec<scalar>` | Same as above. `None` / empty `Vec` when absent; `Vec` takes every value of a repeated key (`?id=1&id=2`) | `fn f(tag: Option<String>, ids: Vec<i64>)` |
+| `{*name}` in the path | The remaining path segments joined with `/` | `#[GET("/files/{*path}")] fn f(path: String)` |
+| `HeaderMap` / `&HeaderMap` | Request headers (`hyper::HeaderMap`) | `fn f(headers: &HeaderMap)` |
+| `RemoteAddr` / `Option<RemoteAddr>` | Client address, see [running the server](#running-the-server) | `fn f(addr: RemoteAddr)` |
+| `BodyStream` | The unbuffered request body | `fn f(body: BodyStream)` |
+| `MultipartFile<Vec<u8>>` / `MultipartFile<&Path>` | A file field of a multipart body, by parameter name | `fn f(folder: String, file: MultipartFile<&Path>)` |
 | `Query<T>` | The whole query string, deserialized into struct `T`, for any HTTP method | `fn f(q: Query<Search>)` |
 | `Ext<T>` / `Option<Ext<T>>` | Data inserted by a [filter](#filters) | `fn f(user: Ext<CurrentUser>)` |
 | `WebSocket` | Only in [`#[WEBSOCKET]`](#websocket) routes | `fn f(socket: WebSocket)` |
@@ -160,7 +167,7 @@ pub async fn find(id: i64, info: Query<UserInfo>) -> String {
 pub async fn create(info: Query<UserInfo>, form: UserForm) -> String { /* ... */ }
 ```
 
-Errors are reported as query parameters, for example `Query parameter "age" is invalid, got "x".`. The same parameter appearing more than once (`?tag=a&tag=b`) can't be bound to a `Vec` yet.
+Errors are reported as query parameters, for example `Query parameter "age" is invalid, got "x".`. Inside `Query<T>`, a repeated key (`?tag=a&tag=b`) can't be bound to a `Vec` field; use a `Vec<String>` handler parameter instead.
 
 **Parameter naming (camelCase front ends).** Front ends usually send camelCase names (`pageSize`), while Rust uses snake_case (`page_size`). How each kind of parameter handles this:
 
@@ -182,6 +189,7 @@ With `ParamNaming::CamelCase`:
 - **Both names are accepted.** `fn list(page_size: u32, sort_by: String)` accepts `?pageSize=20&sortBy=name` as well as `?page_size=20&sort_by=name`. If both appear, the Rust name wins.
 - **The camelCase name is computed at build time**, so there is no string conversion at runtime. Names without an underscore (`id`, `name`) generate exactly the same code as before.
 - **Error messages use the camelCase name**, e.g. `Query parameter "pageSize" is required.`.
+- **Leading underscores are kept**: `_client_flag` also accepts `_clientFlag`. (This differs from serde's `rename_all = "camelCase"`, which drops them.)
 
 To make a whole API camelCase, put `#[serde(rename_all = "camelCase")]` on request and response structs, and turn on `ParamNaming::CamelCase` for scalar parameters.
 
@@ -192,7 +200,7 @@ To make a whole API camelCase, put `#[serde(rename_all = "camelCase")]` on reque
 | `application/json` | `serde_json` (the type must implement `Deserialize`) |
 | `application/x-www-form-urlencoded`, or missing | `serde_urlencoded` |
 | `multipart/form-data` | Field by field, see below |
-| anything else | `400`, unsupported content type |
+| anything else | `400`, unsupported content type (with `ParamBinding::Merged`, a struct is bound from the query string instead) |
 
 **Multipart and file uploads.** For multipart to work, the body struct must be defined **in the same file** as the handler (nesting inside a `mod {}` is fine), so the code generator can see its fields. Each field is filled according to its type:
 
@@ -203,7 +211,11 @@ To make a whole API camelCase, put `#[serde(rename_all = "camelCase")]` on reque
 | `&Path` | File content written to a temp file; you get its path |
 | `MultipartFile<Vec<u8>>` / `MultipartFile<&Path>` | As above, plus `name` (file name) and `content_type` |
 
-A struct containing any file field accepts only `multipart/form-data` and doesn't need `Deserialize`. Temp files are **not** deleted automatically.
+A struct containing any file field accepts only `multipart/form-data` and doesn't need `Deserialize`.
+
+**Uploads are parsed as they arrive.** A file field is kept in memory up to the [multipart memory limit](#body-limits) (1MB by default), then spilled to a temp file that the rest of the upload is streamed into. A multi-GB upload therefore uses only a few MB of memory. Field order doesn't matter: text fields sent after the file still bind normally.
+
+**Temp files are deleted automatically** when the request has been handled, after the handler returns or when parameter parsing fails. To keep an upload, move it inside the handler with `tokio::fs::rename(path, target)` or copy it. `hyperoute_core::write_temp_file` still returns a file that is never deleted.
 
 ```rust
 #[POST("/upload")]
@@ -216,6 +228,98 @@ pub struct UploadForm<'a> {
 }
 ```
 
+### Body limits
+
+These settings are read by the framework itself from environment variables, so your project needs no code for them:
+
+| Environment variable | Meaning | Default |
+|---|---|---|
+| `HYPEROUTE_MULTIPART_MEMORY_LIMIT` | A multipart file larger than this is spilled to a temp file. A text field larger than this answers `413`. | 1MB |
+| `HYPEROUTE_MAX_BODY_SIZE` | Maximum request body size. Larger bodies answer `413`. | unlimited |
+| `HYPEROUTE_UPLOAD_TEMP_DIR` | Directory for upload temp files. It's created if missing. If it can't be created or written, the request answers `500` and the reason is logged. | system temp dir |
+
+- **Where to put temp files.** Put `HYPEROUTE_UPLOAD_TEMP_DIR` on the same file system as your storage directory, so handlers can `rename` uploads instead of copying them. This matters with Docker volumes, and when `/tmp` is a tmpfs held in memory.
+- **Value format.** Sizes look like `65536`, `512KB`, `64MB` or `10GB` (powers of 1024). An invalid value is ignored, with a warning on stderr.
+- **When they're read.** The variables are read once, on first use, so restart the process to change them.
+- **What the size limit covers.** It applies to bodies hyperoute reads for you: JSON, urlencoded, multipart and merged forms. `Content-Length` is checked before reading, and bodies without one are counted while they're read.
+- **`BodyStream` is not limited.** The handler decides, for example with `size_hint()`.
+- **`413` bypasses `#[PARAM_ERROR]`.** It always uses the plain-text default response `Request body is too large.`.
+
+For environments where you can't set environment variables (an app embedded on iOS, for example), the same values can be set in code. A value set in code takes precedence over the environment variable and applies to requests that arrive afterwards:
+
+```rust
+hyperoute_core::set_multipart_memory_limit(64 * 1024 * 1024);
+hyperoute_core::set_max_body_size(Some(10 * 1024 * 1024 * 1024));
+hyperoute_core::set_upload_temp_dir("/app/data/temp");
+```
+
+**Streaming request bodies.** A `BodyStream` parameter receives the body without buffering it, for uploads too large to hold in memory:
+
+```rust
+#[POST("/upload/{name}")]
+pub async fn upload(name: String, mut body: BodyStream) -> Result<String, ApiError> {
+    let mut file = tokio::fs::File::create(format!("/data/{name}")).await?;
+    while let Some(chunk) = body.next_chunk().await {
+        file.write_all(&chunk?).await?;
+    }
+    Ok("ok".into())
+}
+```
+
+`BodyStream` also implements `futures::Stream`, and `size_hint()` returns the `Content-Length` if there is one. A handler can have at most one, and it can't be combined with a body struct or file parameters (the build fails). If a filter called `read_body`, the handler gets the copy the filter put back.
+
+### Form binding (Go / Spring style)
+
+By default, scalar parameters come only from the query string, and a struct parameter is decoded from the body. Projects migrating from Go's `net/http` (`request.Form`) or Spring can switch to merged binding in `build.rs`:
+
+```rust
+use hyperoute_codegen::{ParamBinding, ParamFallback};
+
+hyperoute_codegen::Scanner::new()
+    .dir(src.join("controller"), "crate::controller")
+    .param_binding(ParamBinding::Merged)     // default: ParamBinding::Separate
+    .param_fallback(ParamFallback::Default)  // optional, default: ParamFallback::Strict
+    .scan();
+```
+
+With `ParamBinding::Merged`, the query string and form body are merged, in the same order as Go:
+
+| Body | Order of values |
+|---|---|
+| `application/x-www-form-urlencoded` (or no content type) | body values first, then query values |
+| `multipart/form-data` | query values first, then text fields |
+| anything else (JSON, ...) | query values only |
+
+- **Scalars take the first value, `Vec` takes all values.** Like Go's AutoWeb, a single value written as `"[a,b,c]"` is also split into a list: the brackets are stripped, the value is split on `,`, and `_2c` in each item turns back into `,`. A scalar takes the first item, so `?id=[5]` gives `5`. `"[]"` gives one empty string, as in Go.
+- **Struct parameters are bound from the merged form by field name**, so a GET query string can fill a struct too. `Option` and `Vec` fields, unit enum variants and serde attributes (`rename`, `rename_all`, `alias`, `default`) work. JSON bodies are still decoded as JSON. With `ParamNaming::CamelCase`, fields also accept their camelCase name.
+- **The body is read once**, so scalars and file parameters can share a handler:
+
+```rust
+#[POST("/upload")]
+pub async fn upload(folder: String, content_type: String, file: MultipartFile<&Path>) -> String { /* ... */ }
+```
+
+- Routes with a `BodyStream` parameter, and WebSocket routes, don't read the body, so their parameters come from the query string only.
+- When a parameter is missing in merged mode, the error says `Parameter "id" is required.` (location `form`).
+
+**Lenient mode** (`ParamFallback::Default`). A missing or malformed scalar becomes `Default::default()` instead of a `400`. `Option` gets `None`, and malformed items in a `Vec` become the default value, matching Go, which ignores conversion errors. It also works without merged binding. Override it per handler with a marker attribute:
+
+```rust
+use hyperoute_macro::{GET, PARAM_LENIENT, PARAM_STRICT};
+
+#[PARAM_STRICT]   // always 400 on bad parameters, whatever the global setting is
+#[GET("/api/v2/items")]
+pub async fn items(page: u32) -> String { /* ... */ }
+
+#[PARAM_LENIENT]  // defaults instead of 400, even when the global setting is Strict
+#[GET("/legacy/list")]
+pub async fn legacy(page: u32, size: Option<u32>) -> String { /* ... */ }
+```
+
+- **Struct fields.** Missing fields and malformed values become defaults, and serde's `#[serde(default = ...)]` still takes precedence. Enum fields have no generic default, so a missing or unknown enum value is still an error; add `#[serde(default)]` to make it optional.
+- **What stays strict.** Path parameters, file fields, JSON bodies and `Query<T>` are always strict.
+- **Debug logging.** Every fallback is logged to stderr in debug builds, so you can find clients that send bad parameters.
+
 ## Responses
 
 The return type decides how the response is built:
@@ -223,8 +327,8 @@ The return type decides how the response is built:
 | Return type | Response |
 |---|---|
 | `&str`, `String` | `200`, body as-is |
-| `hyperoute_core::Raw` | `200`, bytes + headers you set |
-| `hyperoute_core::Stream` | `200`, streamed body + headers you set |
+| `hyperoute_core::Raw` | bytes + headers you set; status `200` unless you call `.status(...)` |
+| `hyperoute_core::Stream` | streamed body + headers you set; status `200` unless you call `.status(...)` |
 | Any other type | `200`, `application/json` via `serde_json` |
 | `Result<T, E>` | `Ok(T)` follows the rules above. `Err(E)` is converted with `IntoErrorResponse`. |
 
@@ -240,6 +344,28 @@ pub async fn big_file() -> Stream {
     Stream::new(tokio_util::io::ReaderStream::new(file)).header("content-type", "application/octet-stream")
 }
 ```
+
+**Files with Range support.** `Stream::file(path, &headers)` serves a file and handles the request headers for you:
+- **Range.** It supports single ranges (`bytes=a-b`, `a-`, `-n`) and answers `206` with `Content-Range`.
+- **Invalid ranges.** A range that can't be satisfied answers `416`. A multi-range or unrecognized header is ignored, and the whole file is sent with `200`.
+- **If-Range.** If it doesn't match the current ETag or Last-Modified, the Range is ignored.
+- **Conditional requests.** A matching `If-None-Match` or `If-Modified-Since` answers `304`.
+- **Response headers.** It always sets `Accept-Ranges: bytes`, `Content-Length`, an `ETag` derived from size and mtime, and `Last-Modified`.
+
+```rust
+#[GET("/files/{*path}")]
+pub async fn download(path: String, headers: &HeaderMap) -> Result<Stream, ApiError> {
+    let stream = Stream::file(Path::new("/data").join(&path), headers).await
+        .map_err(|_| ApiError::not_found())?;          // io::Error: missing, not a file, ...
+    Ok(stream.attachment("报告.pdf"))                   // or .inline(name), .content_type("video/mp4")
+}
+```
+
+- **Builder methods.**
+  - `.attachment(name)` and `.inline(name)` set `Content-Disposition` with an RFC 5987 `filename*` for non-ASCII names.
+  - `.content_type(..)` replaces the type guessed from the extension.
+  - `.set_header(..)` replaces a header, while `.header(..)` appends one.
+- **Static directories don't support Range.** Use a handler with `Stream::file` for downloads and video.
 
 **Error types** implement `IntoErrorResponse`. The examples below share this JSON error type:
 
@@ -298,9 +424,10 @@ pub fn on_param_error(errors: ParamErrors) -> ApiError {
     let e = errors.first(); // currently always exactly one error
     ApiError::new(StatusCode::BAD_REQUEST, json!({
         "code": "INVALID_PARAM",
-        "location": e.location.as_str(), // path | query | body | multipart | header
+        "location": e.location.as_str(), // path | query | body | multipart | header | form
         "param": e.param,                // e.g. "id", "items[2].age"; None for the whole body
         "kind": e.kind.as_str(),         // missing | invalid | out_of_range | unsupported_content_type | malformed_body
+                                         // (payload_too_large never reaches this function: it always answers 413)
         "message": e.to_string(),        // the neutral default message
     }))
 }
@@ -467,10 +594,12 @@ For full control (TLS, connection limits, socket options, graceful shutdown), wr
 ```rust
 let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
 loop {
-    let (stream, _) = listener.accept().await?;
-    tokio::spawn(hyperoute_core::serve_connection(stream, routes::router));
+    let (stream, peer) = listener.accept().await?;
+    tokio::spawn(hyperoute_core::serve_connection_with_addr(stream, peer, routes::router));
 }
 ```
+
+Use `serve_connection_with_addr(stream, peer, routes::router)` instead to make the client address available. Handlers get it with a `RemoteAddr` parameter, and filters with `RemoteAddr::from_request(&req)`. `serve` always provides it. With plain `serve_connection`, a `RemoteAddr` parameter answers `500` (logged), and `Option<RemoteAddr>` gets `None`. Behind a reverse proxy this is the proxy's address; read `X-Forwarded-For` from the headers for the original client.
 
 Both use HTTP/1.1 with upgrades enabled. If you drive `routes::router` with hyper directly, call `.with_upgrades()` on the connection, or WebSocket upgrades will not work.
 
@@ -487,7 +616,9 @@ $ curl -H 'Authorization: Bearer demo-token' http://127.0.0.1:3000/api/profile
 | File | Shows |
 |---|---|
 | `controller/hello.rs` | Basic routes, `#[REQUEST]` |
-| `controller/params.rs` | Path, query, JSON / urlencoded / multipart bodies, file uploads |
+| `controller/params.rs` | Path, query, `Option` / `Vec`, `#[PARAM_LENIENT]`, JSON / urlencoded / multipart bodies, file uploads |
+| `controller/files.rs` | `{*path}` wildcard, `Stream::file` with Range, `&HeaderMap`, `RemoteAddr`, `BodyStream` uploads |
+| `compat/dfs.rs` | Go-compatible binding: `ParamBinding::Merged` + `ParamFallback::Default`, `"[a,b]"` lists, scalars + file in one handler, `#[PARAM_STRICT]`. `build.rs` scans `src/compat` with a second `Scanner`, and `server.rs` routes `/compat/*` to it. |
 | `controller/responses.rs` | Text, JSON, `Result`, `Raw`, `Stream` |
 | `controller/param_error.rs` | Custom parameter error format (`#[PARAM_ERROR]`) |
 | `controller/user.rs` | Receiving filter data with `Ext<T>` / `Option<Ext<T>>` |
@@ -495,7 +626,8 @@ $ curl -H 'Authorization: Bearer demo-token' http://127.0.0.1:3000/api/profile
 | `filter/auth.rs` | Bearer-token auth filter: before phase, short-circuit, passing data |
 | `filter/access_log.rs` | Timing filter: after phase |
 | `error.rs` | A shared JSON error type |
-| `server.rs` | `serve` and a custom accept loop with `serve_connection` |
+| `server.rs` | `serve` and a custom accept loop with `serve_connection_with_addr` |
+| `tests.rs` | End-to-end tests over real TCP (`cargo test -p hyperoute-sample`) |
 | `static/` + `build.rs` | Static files at `/static`: sub-directories, gzip, ETag/304, HTML includes (`static/include/header.tpl.html`), and `static/private/` protected by the auth filter |
 
 Every handler has a `curl` command in its doc comment.

@@ -1,7 +1,10 @@
+mod compat;
 mod controller;
 mod error;
 mod filter;
 mod server;
+#[cfg(test)]
+mod tests;
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {

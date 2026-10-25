@@ -30,6 +30,8 @@ pub enum ParamLocation {
     MultipartField,
     /// 请求头，例如 WebSocket 握手需要的 `upgrade` / `sec-websocket-key`
     Header,
+    /// 合并表单（`ParamBinding::Merged`）：查询串和表单请求体合并后取值，参数没传时报这个位置
+    Form,
 }
 
 impl ParamLocation {
@@ -40,6 +42,7 @@ impl ParamLocation {
             ParamLocation::Body => "body",
             ParamLocation::MultipartField => "multipart",
             ParamLocation::Header => "header",
+            ParamLocation::Form => "form",
         }
     }
 }
@@ -62,6 +65,12 @@ pub enum ParamErrorKind {
     UnsupportedContentType,
     /// 请求体本身读取失败或格式不合法（例如 JSON 语法错误、multipart boundary 非法）
     MalformedBody,
+    /// 请求体超过 `HYPEROUTE_MAX_BODY_SIZE`，或 multipart 文本字段超过内存阈值：
+    /// 生成代码直接返回 413，不经过 `#[PARAM_ERROR]`
+    PayloadTooLarge,
+    /// 服务端处理请求体时出错（例如上传临时文件写入失败），不是客户端的问题：
+    /// 生成代码记日志并返回 500，不经过 `#[PARAM_ERROR]`
+    Internal,
 }
 
 impl ParamErrorKind {
@@ -72,6 +81,8 @@ impl ParamErrorKind {
             ParamErrorKind::OutOfRange => "out_of_range",
             ParamErrorKind::UnsupportedContentType => "unsupported_content_type",
             ParamErrorKind::MalformedBody => "malformed_body",
+            ParamErrorKind::PayloadTooLarge => "payload_too_large",
+            ParamErrorKind::Internal => "internal",
         }
     }
 }
@@ -153,12 +164,14 @@ impl ParamError {
     fn subject(&self) -> String {
         match (&self.param, self.location) {
             (None, ParamLocation::Query) => "Query string".to_string(),
+            (None, ParamLocation::Form) => "Request parameters".to_string(),
             (None, _) => "Request body".to_string(),
             (Some(p), ParamLocation::Path) => format!("Path parameter \"{}\"", escape(p)),
             (Some(p), ParamLocation::Query) => format!("Query parameter \"{}\"", escape(p)),
             (Some(p), ParamLocation::Body) => format!("Field \"{}\" in request body", escape(p)),
             (Some(p), ParamLocation::MultipartField) => format!("Form field \"{}\"", escape(p)),
             (Some(p), ParamLocation::Header) => format!("Header \"{}\"", escape(p)),
+            (Some(p), ParamLocation::Form) => format!("Parameter \"{}\"", escape(p)),
         }
     }
 
@@ -202,6 +215,8 @@ impl fmt::Display for ParamError {
                 Some(_) => write!(f, "Content-Type{} is not supported for this endpoint.", got_value(&got)),
             },
             ParamErrorKind::MalformedBody => write!(f, "Request body is malformed{detail}."),
+            ParamErrorKind::PayloadTooLarge => write!(f, "Request body is too large."),
+            ParamErrorKind::Internal => write!(f, "Internal Server Error"),
         }
     }
 }
@@ -281,7 +296,11 @@ pub struct DefaultParamErrorResponse(pub ParamErrors);
 
 impl IntoErrorResponse for DefaultParamErrorResponse {
     fn status(&self) -> StatusCode {
-        StatusCode::BAD_REQUEST
+        match self.0.first().kind {
+            ParamErrorKind::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+            ParamErrorKind::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+            _ => StatusCode::BAD_REQUEST,
+        }
     }
 
     fn message(&self) -> String {

@@ -32,3 +32,8 @@ define_method_attribute!(FILTER);
 // 标注 WebSocket 路由：`#[WEBSOCKET("/ws/chat/{room}")] async fn chat(socket: WebSocket, room: String, ...)`，
 // 握手由框架完成，函数在连接建立后被调用；其它参数（路径 / 查询 / Ext）和普通路由一样解析。
 define_method_attribute!(WEBSOCKET);
+// 参数缺失 / 转换失败时的处理，覆盖 build.rs 里 `Scanner::param_fallback` 的全局设置：
+// `#[PARAM_STRICT]` 返回参数错误（400），`#[PARAM_LENIENT]` 得到 `Default::default()`（`Option` 得到 `None`）。
+// 和路由属性写在同一个函数上，例如 `#[PARAM_LENIENT] #[GET("/list")]`。
+define_method_attribute!(PARAM_STRICT);
+define_method_attribute!(PARAM_LENIENT);
